@@ -43,6 +43,7 @@ use crate::engine::bridge::{
     helpers::{error_stream, get_max_context_length, get_sampling_method},
 };
 
+#[derive(Clone)]
 pub struct UzuChatTokenBackendInstance<B: Backend> {
     engine: Arc<Engine<B>>,
     model: Arc<LanguageModel<B>>,
@@ -98,7 +99,6 @@ impl<B: Backend> BackendInstance for UzuChatTokenBackendInstance<B> {
 
     fn state(&self) -> Pin<Box<dyn Future<Output = Result<Box<dyn State>, BackendError>> + Send + '_>> {
         Box::pin(async move {
-            let max_context_length = get_max_context_length(&self.model, self.config.context_length.clone());
             let sampling_seed = match &self.config.sampling_seed {
                 SamplingSeed::Default {} => rand::random(),
                 SamplingSeed::Custom {
@@ -106,7 +106,7 @@ impl<B: Backend> BackendInstance for UzuChatTokenBackendInstance<B> {
                 } => *seed as u64,
             };
             self.model
-                .create_empty_state(max_context_length, sampling_seed)
+                .create_empty_state(self.max_context_length, sampling_seed)
                 .map_err(|err| BackendError::from(err.to_string()))
                 .map(|state| Box::new(UzuChatTokenBackendInstanceState::new(state)) as Box<dyn State>)
         })
@@ -178,6 +178,7 @@ impl<B: Backend> BackendInstance for UzuChatTokenBackendInstance<B> {
         Box::pin(UzuChatTokenStream::<B> {
             cancel_token: cancel_token.child_token(),
             stream: unsafe { std::mem::transmute::<LanguageModelStream<'_, B>, LanguageModelStream<'a, B>>(stream) },
+            finished: false,
             tokens_generated: 0,
             token_limit,
             _state_guard: unsafe {
@@ -197,6 +198,17 @@ impl<B: Backend> BackendInstance for UzuChatTokenBackendInstance<B> {
 }
 
 impl<B: Backend> ChatTokenBackendInstance for UzuChatTokenBackendInstance<B> {
+    fn with_config(
+        &self,
+        config: ChatConfig,
+    ) -> Box<dyn ChatTokenBackendInstance> {
+        Box::new(Self {
+            max_context_length: get_max_context_length(&self.model, config.context_length.clone()),
+            config,
+            ..self.clone()
+        })
+    }
+
     fn tokenizer(&self) -> Arc<Tokenizer> {
         self.model.tokenizer().clone()
     }
@@ -219,6 +231,7 @@ impl<B: Backend> ChatTokenBackendInstance for UzuChatTokenBackendInstance<B> {
 struct UzuChatTokenStream<'a, B: Backend> {
     cancel_token: CancellationToken,
     stream: LanguageModelStream<'a, B>,
+    finished: bool,
     tokens_generated: usize,
     token_limit: Option<usize>,
     _state_guard: Pin<Box<MutexGuard<'a, LanguageModelState<B>>>>,
@@ -227,27 +240,38 @@ struct UzuChatTokenStream<'a, B: Backend> {
 }
 
 impl<'a, B: Backend> UzuChatTokenStream<'a, B> {
+    fn finish(&mut self) -> Result<(), BackendError> {
+        self.finished = true;
+        self.stream.close().map_err(|error| BackendError::from(error.to_string()))
+    }
+
     fn next(&mut self) -> Result<Option<TokenStreamOutput>, BackendError> {
-        if self.cancel_token.is_cancelled() {
+        if self.finished {
             return Ok(None);
         }
-
+        if self.cancel_token.is_cancelled() {
+            self.finish()?;
+            return Ok(None);
+        }
         if self.token_limit.is_some_and(|token_limit| self.tokens_generated >= token_limit) {
-            self.cancel_token.cancel();
+            self.finish()?;
             return Ok(Some(TokenStreamOutput::LimitReached));
         }
 
-        let token = self
-            .stream
-            .next()
-            .transpose()
-            .map_err(|err| Box::<dyn std::error::Error + Send + Sync>::from(err.to_string()))?;
-
-        if token.is_some() {
-            self.tokens_generated += 1;
+        match self.stream.next() {
+            Some(Ok(token)) => {
+                self.tokens_generated += 1;
+                Ok(Some(TokenStreamOutput::Token(token)))
+            },
+            Some(Err(error)) => {
+                let _ = self.finish();
+                Err(BackendError::from(error.to_string()))
+            },
+            None => {
+                self.finish()?;
+                Ok(None)
+            },
         }
-
-        Ok(token.map(TokenStreamOutput::Token))
     }
 }
 
