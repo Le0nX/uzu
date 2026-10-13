@@ -1,4 +1,5 @@
 pub const TILE_KEYS: u32 = 32;
+pub const QUERY_TILE_ROWS: u32 = 16;
 pub const KV_ROTATION_SIGN_BITS: [u32; 8] =
     [0x9e3779b9, 0x85ebca6b, 0xc2b2ae35, 0x27d4eb2f, 0x165667b1, 0xbf58476d, 0x94d049bb, 0xd6e8feb8];
 const TILE_DIMS: u32 = 16;
@@ -27,6 +28,14 @@ impl Int8KVLayout {
         head: u32,
     ) -> usize {
         ((key / TILE_KEYS * self.num_kv_heads + head) * TILE_KEYS + key % TILE_KEYS) as usize
+    }
+
+    pub fn tile_bytes(
+        &self,
+        keys: u32,
+    ) -> usize {
+        keys.min(self.padded_capacity).next_multiple_of(TILE_KEYS) as usize
+            * (self.num_kv_heads * self.head_dim) as usize
     }
 
     pub fn k_code_index(
