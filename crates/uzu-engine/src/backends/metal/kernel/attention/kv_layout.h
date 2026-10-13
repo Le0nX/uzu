@@ -9,6 +9,7 @@
 //   k_scales bf16   [key block][kv head][key in block]                             a prefix of keys is a byte prefix
 //   v_scales bf16   [key block][kv head][key in block]
 // clang-format on
+// The planes start zeroed and writers store a scale > 0, so a scale <= 0 marks a slot never written.
 
 namespace uzu::kv_layout {
 
