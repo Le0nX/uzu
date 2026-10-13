@@ -1,6 +1,6 @@
 use uzu_engine_macros::uzu_test;
 
-pub use crate::backends::common::kernel::kv_layout::Int8KVLayout;
+use crate::backends::common::kernel::kv_layout::Int8KVLayout;
 
 #[uzu_test]
 fn code_planes_are_bijections() {

@@ -20,10 +20,10 @@ pub fn attention_prepare_int8<ElementT: DataTypeRepr + Float, RopeT: DataTypeRep
     #[optional(!quantize_queries)] queries: Option<*mut ElementT>,
     #[optional(quantize_queries)] q_codes: Option<*mut i8>,
     #[optional(quantize_queries)] q_scales: Option<*mut ElementT>,
-    k_codes: *mut i8,
-    k_scales: *mut ElementT,
-    v_codes: *mut u8,
-    v_scales: *mut ElementT,
+    #[optional(append_kv)] k_codes: Option<*mut i8>,
+    #[optional(append_kv)] k_scales: Option<*mut ElementT>,
+    #[optional(append_kv)] v_codes: Option<*mut u8>,
+    #[optional(append_kv)] v_scales: Option<*mut ElementT>,
     #[optional(has_rope)] cosines: Option<*const RopeT>,
     #[optional(has_rope)] sines: Option<*const RopeT>,
     num_q_heads: u32,
@@ -35,6 +35,7 @@ pub fn attention_prepare_int8<ElementT: DataTypeRepr + Float, RopeT: DataTypeRep
     #[specialize] has_rope: bool,
     #[specialize] quantize_queries: bool,
     #[specialize] num_kv_heads: u32,
+    #[specialize] append_kv: bool,
 ) {
     let head_dim = HEAD_DIM as usize;
     let layout = Int8KVLayout::new(HEAD_DIM, num_kv_heads);
@@ -42,6 +43,9 @@ pub fn attention_prepare_int8<ElementT: DataTypeRepr + Float, RopeT: DataTypeRep
     for head in 0..num_q_heads + 2 * num_kv_heads {
         let is_query = head < num_q_heads;
         let is_key = head >= num_q_heads && head < num_q_heads + num_kv_heads;
+        if !append_kv && !is_query {
+            continue;
+        }
         let kv_head = if is_query {
             0
         } else if is_key {
@@ -107,9 +111,10 @@ pub fn attention_prepare_int8<ElementT: DataTypeRepr + Float, RopeT: DataTypeRep
                     if is_query {
                         *q_codes.unwrap().add(scale_index * head_dim + channel) = code;
                     } else if is_key {
-                        *k_codes.add(layout.k_code_index(kv_token_offset + token, kv_head, channel as u32)) = code;
+                        *k_codes.unwrap().add(layout.k_code_index(kv_token_offset + token, kv_head, channel as u32)) =
+                            code;
                     } else {
-                        *v_codes.add(layout.v_code_index(kv_token_offset + token, kv_head, channel as u32)) =
+                        *v_codes.unwrap().add(layout.v_code_index(kv_token_offset + token, kv_head, channel as u32)) =
                             (i16::from(code) + 128) as u8;
                     }
                 }
@@ -118,9 +123,9 @@ pub fn attention_prepare_int8<ElementT: DataTypeRepr + Float, RopeT: DataTypeRep
                 if is_query {
                     *q_scales.unwrap().add(scale_index) = scale;
                 } else if is_key {
-                    *k_scales.add(scale_index) = scale;
+                    *k_scales.unwrap().add(scale_index) = scale;
                 } else {
-                    *v_scales.add(scale_index) = scale;
+                    *v_scales.unwrap().add(scale_index) = scale;
                 }
             }
         }
