@@ -68,7 +68,6 @@ KERNEL(AttentionGemmGroupedInt8)(
     const constant uint& m_tiles,
     const constant uint& batch_count,
     const constant uint& num_splits,
-    const constant uint& padded_capacity,
     const constant uint& split_base,
     const constant uint& split_count,
     const constant uint& trie_nodes,
@@ -236,8 +235,11 @@ KERNEL(AttentionGemmGroupedInt8)(
 
   const AccumType score_scale = AccumType(params.scale) * AccumType(M_LOG2E_F);
 
-  const device T* key_scales_base = k_scales + size_t(kv_head_idx) * padded_capacity + size_t(first_key);
-  const device T* value_scales_base = v_scales + size_t(kv_head_idx) * padded_capacity + size_t(first_key);
+  // Scales are [key block][kv head][32 keys]: one block's 32 scales are contiguous, blocks are num_kv_heads apart.
+  const uint scale_block_stride = uint(TILE_KEYS) * num_kv_heads;
+  const size_t split_scale_offset = Int8KVShape{HEAD_DIM, num_kv_heads}.scale_index(first_key, kv_head_idx);
+  const device T* key_scales_base = k_scales + split_scale_offset;
+  const device T* value_scales_base = v_scales + split_scale_offset;
 
   AccumType query_row_scale[ROWS_PER_LANE];
   METAL_PRAGMA_UNROLL
@@ -258,7 +260,7 @@ KERNEL(AttentionGemmGroupedInt8)(
       reinterpret_cast<threadgroup float2*>(stat_slot + Int8Layout::STAT_FLOATS) +
       uint(band_first_simdgroup) * STAT_ROWS + uint(score_position.y);
   uint slot_offset = 0u;
-  uint scale_offset = uint(slice) * uint(TILE_KEYS) + uint(score_position.x);
+  uint scale_offset = uint(slice) * scale_block_stride + uint(score_position.x);
 
   // Per step, each slice simdgroup scores one key block and publishes P; then all accumulate P x V.
   uint kb = 0;
@@ -329,8 +331,9 @@ KERNEL(AttentionGemmGroupedInt8)(
             const int lane_col = fragment_col * Ops::THREAD_ELEMENT_COLS + col;
             key_scale[lane_col] = AccumType(key_scale_lane[fragment_col * Ops::FRAGMENT_COLS + col]);
             const float v_scale = float(value_scale_lane[fragment_col * Ops::FRAGMENT_COLS + col]);
-            // A never-written slot (scale 0) gives (0, 0), so masked keys stay finite.
-            const bool written = v_scale > 0.0f;
+            // A never-written slot holds garbage: below MIN_VALUE_SCALE (0, negative, NaN, denormal) gives (0, 0), so
+            // 1 / scale stays finite and masked keys contribute exactly 0.
+            const bool written = v_scale >= MIN_VALUE_SCALE;
             log2_value_scale[lane_col] = written ? metal::precise::log2(v_scale) : 0.0f;
             inverse_value_scale[lane_col] = written ? metal::precise::divide(1.0f, v_scale) : 0.0f;
           }
@@ -492,7 +495,7 @@ KERNEL(AttentionGemmGroupedInt8)(
     // Double-buffered: the next step writes the other slot, so one barrier per step suffices.
     slot_offset = uint(Int8Layout::SLOT_FLOATS) - slot_offset;
     kb += step_blocks;
-    scale_offset += step_blocks * uint(TILE_KEYS);
+    scale_offset += step_blocks * scale_block_stride;
   }
 
   // Normalize and store the split partials.

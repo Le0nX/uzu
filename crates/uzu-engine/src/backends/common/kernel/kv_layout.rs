@@ -1,3 +1,5 @@
+use half::bf16;
+
 pub const TILE_KEYS: u32 = 32;
 pub const QUERY_TILE_ROWS: u32 = 16;
 pub const KV_ROTATION_SIGN_BITS: [u32; 8] =
@@ -36,6 +38,22 @@ impl Int8KVLayout {
     ) -> usize {
         keys.min(self.padded_capacity).next_multiple_of(TILE_KEYS) as usize
             * (self.num_kv_heads * self.head_dim) as usize
+    }
+
+    /// Scales are `[key tile][kv head][TILE_KEYS keys]`, so a prefix of keys is a byte prefix.
+    pub fn scale_index(
+        &self,
+        key: u32,
+        head: u32,
+    ) -> usize {
+        ((key / TILE_KEYS * self.num_kv_heads + head) * TILE_KEYS + key % TILE_KEYS) as usize
+    }
+
+    pub fn scale_tile_bytes(
+        &self,
+        keys: u32,
+    ) -> usize {
+        self.tile_bytes(keys) / self.head_dim as usize * size_of::<bf16>()
     }
 
     pub fn k_code_index(

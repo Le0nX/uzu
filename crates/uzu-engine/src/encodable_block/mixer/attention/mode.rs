@@ -218,15 +218,14 @@ impl<B: Backend> Attention<B> {
             command_buffer.allocate_scratch_for_shape(&[self.num_q_heads, padded, self.head_dim], DataType::I8)?;
         let mut query_scales =
             command_buffer.allocate_scratch_for_shape(&[self.num_q_heads, padded], DataType::BF16)?;
-        let (padded_capacity, k_codes, k_scales, v_codes, v_scales) = match kv {
+        let (k_codes, k_scales, v_codes, v_scales) = match kv {
             Some(kv) => (
-                kv.layout.padded_capacity,
                 Some(kv.k_codes.as_mut()),
-                Some(&mut kv.k_scales),
+                Some(kv.k_scales.as_mut()),
                 Some(kv.v_codes.as_mut()),
-                Some(&mut kv.v_scales),
+                Some(kv.v_scales.as_mut()),
             ),
-            None => (0, None, None, None, None),
+            None => (None, None, None, None),
         };
         self.prepare_int8.as_ref().expect("INT8 prepare kernel").encode(
             qkvg,
@@ -242,7 +241,6 @@ impl<B: Backend> Attention<B> {
             self.num_q_heads,
             rope.map(|rope| rope.dim),
             cache.prefix_len(),
-            padded_capacity,
             self.projection_dim,
             suffix_length,
             padded,
