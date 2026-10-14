@@ -31,7 +31,7 @@ pub fn attention_prepare_int8<ElementT: DataTypeRepr + Float, RopeT: DataTypeRep
     kv_token_offset: u32,
     input_row_stride: u32,
     suffix_length: u32,
-    padded_suffix: u32,
+    query_rows: u32,
     #[specialize] has_rope: bool,
     #[specialize] quantize_queries: bool,
     #[specialize] num_kv_heads: u32,
@@ -40,6 +40,7 @@ pub fn attention_prepare_int8<ElementT: DataTypeRepr + Float, RopeT: DataTypeRep
     let head_dim = HEAD_DIM as usize;
     let layout = Int8KVLayout::new(HEAD_DIM, num_kv_heads);
     let mut values = vec![0.0f32; head_dim];
+    let gqa_factor = num_q_heads / num_kv_heads;
     for head in 0..num_q_heads + 2 * num_kv_heads {
         let is_query = head < num_q_heads;
         let is_key = head >= num_q_heads && head < num_q_heads + num_kv_heads;
@@ -53,17 +54,8 @@ pub fn attention_prepare_int8<ElementT: DataTypeRepr + Float, RopeT: DataTypeRep
         } else {
             head - num_q_heads - num_kv_heads
         };
-        for token in 0..padded_suffix {
-            let query_row = (head * padded_suffix + token) as usize;
-            if token >= suffix_length {
-                if is_query && quantize_queries {
-                    unsafe {
-                        std::ptr::write_bytes(q_codes.unwrap().add(query_row * head_dim), 0, head_dim);
-                        *q_scales.unwrap().add(query_row) = ElementT::from(1.0).unwrap();
-                    }
-                }
-                continue;
-            }
+        for token in 0..suffix_length {
+            let query_row = ((head / gqa_factor) * query_rows + (head % gqa_factor) * suffix_length + token) as usize;
             let source = unsafe { qkvg.add((token * input_row_stride + head * HEAD_DIM) as usize) };
             for (channel, value) in values.iter_mut().enumerate() {
                 let element = if has_rope && (is_query || is_key) && channel < rope_dim.unwrap() as usize {

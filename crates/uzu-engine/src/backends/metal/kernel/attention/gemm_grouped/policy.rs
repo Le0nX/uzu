@@ -1,7 +1,10 @@
 use super::MaskKind;
 use crate::{
     backends::{
-        common::kernel::{AttentionKernelConfig, kv_layout::TILE_KEYS},
+        common::kernel::{
+            AttentionKernelConfig,
+            kv_layout::{QUERY_TILE_ROWS, TILE_KEYS},
+        },
         metal::context::MetalContext,
     },
     data_type::DataType,
@@ -13,6 +16,8 @@ const GEMM_GROUPED_DECODE_SUFFIX_MAX: u32 = 64;
 const GEMM_GROUPED_PREFILL_SUFFIX_MAX: u32 = 1024;
 const GEMM_GROUPED_MIN_KV_LENGTH: u32 = 1024;
 pub const MAX_TRIE_SUFFIX: u32 = 64;
+const SMALL_SUFFIX_MAX: u32 = 4;
+const SMALL_SUFFIX_MAX_SPLITS: u32 = 16;
 
 pub fn is_supported(
     arguments: &AttentionKernelConfig,
@@ -156,7 +161,14 @@ pub fn int8_splits(
 ) -> u32 {
     let max_splits = kv_length.div_ceil(TILE_KEYS).max(1);
     let splits = if suffix_length <= GEMM_GROUPED_DECODE_SUFFIX_MAX {
-        (kv_length as f32 / suffix_length.max(1) as f32).sqrt().round() as u32
+        // A partial query tile costs as much as a full one.
+        let splits = (kv_length as f32 / suffix_length.max(QUERY_TILE_ROWS) as f32).sqrt().round() as u32;
+        // Tuned on M5 Max.
+        if suffix_length <= SMALL_SUFFIX_MAX {
+            splits.min(SMALL_SUFFIX_MAX_SPLITS)
+        } else {
+            splits
+        }
     } else if kv_length >= PREFILL_SPLIT_MIN_KV {
         // One partial row: `head_dim` BF16 means, one F32 max, one F32 sum.
         let single_split_bytes = split_rows as u64 * (head_dim as u64 * 2 + 8);

@@ -7,6 +7,14 @@ pub const KV_ROTATION_SIGN_BITS: [u32; 8] =
 const TILE_DIMS: u32 = 16;
 const SLICE_DIMS: u32 = 64;
 
+/// Query rows per KV head, `[head in group][query]`, padded to whole query tiles.
+pub fn packed_query_rows(
+    gqa_factor: u32,
+    suffix_length: u32,
+) -> u32 {
+    (gqa_factor * suffix_length).next_multiple_of(QUERY_TILE_ROWS)
+}
+
 pub struct Int8KVLayout {
     pub head_dim: u32,
     pub num_kv_heads: u32,
@@ -23,21 +31,11 @@ impl Int8KVLayout {
         }
     }
 
-    /// Scales are `[key tile][kv head][TILE_KEYS keys]`, so a prefix of keys is a byte prefix.
-    pub fn scale_index(
-        &self,
-        key: u32,
-        head: u32,
-    ) -> usize {
-        ((key / TILE_KEYS * self.num_kv_heads + head) * TILE_KEYS + key % TILE_KEYS) as usize
-    }
-
     pub fn tile_bytes(
         &self,
         keys: u32,
     ) -> usize {
-        keys.min(self.padded_capacity).next_multiple_of(TILE_KEYS) as usize
-            * (self.num_kv_heads * self.head_dim) as usize
+        keys.next_multiple_of(TILE_KEYS) as usize * (self.num_kv_heads * self.head_dim) as usize
     }
 
     /// Scales are `[key tile][kv head][TILE_KEYS keys]`, so a prefix of keys is a byte prefix.

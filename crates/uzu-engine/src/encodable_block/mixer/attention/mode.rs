@@ -3,7 +3,7 @@ use crate::{
         Backend, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding,
         kernel::{
             AttentionArguments, AttentionKernel, AttentionPrepareInt8Kernel, AttentionPrepareKernel,
-            Int8AttentionArguments, kv_layout::QUERY_TILE_ROWS,
+            Int8AttentionArguments, kv_layout::packed_query_rows,
         },
     },
     data_type::DataType,
@@ -51,7 +51,7 @@ impl<B: Backend> Attention<B> {
         state: Option<MaybeMut<AttentionState<B>>>,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<B::ScratchBuffer, AttentionEncodeError<B>> {
-        let qkvg = self.projection.project(hidden, batch_dim.size(), command_buffer).map_err(AttentionEncodeError::Backend)?;
+        let qkvg = self.projection.project(hidden, batch_dim.size(), command_buffer)?;
         let gate = self.has_gate.then(|| {
             qkvg.subrange(
                 (self.projection_dim - self.num_q_heads * self.head_dim) as usize * self.data_type.size_in_bytes()..,
@@ -66,20 +66,24 @@ impl<B: Backend> Attention<B> {
                 assert!(batch_dim.is_flat(), "stateless attention doesn't support trie");
 
                 let mut keys = command_buffer
-                    .allocate_scratch_for_shape(&[batch_dim.size(), num_kv_heads, self.head_dim], self.data_type).map_err(AttentionEncodeError::Backend)?;
+                    .allocate_scratch_for_shape(&[batch_dim.size(), num_kv_heads, self.head_dim], self.data_type)
+                    .map_err(AttentionEncodeError::Backend)?;
                 let mut values = command_buffer
-                    .allocate_scratch_for_shape(&[batch_dim.size(), num_kv_heads, self.head_dim], self.data_type).map_err(AttentionEncodeError::Backend)?;
+                    .allocate_scratch_for_shape(&[batch_dim.size(), num_kv_heads, self.head_dim], self.data_type)
+                    .map_err(AttentionEncodeError::Backend)?;
 
-                let queries = self.prepare_kv_and_queries(
-                    &qkvg,
-                    &mut keys,
-                    &mut values,
-                    0,
-                    self.num_q_heads,
-                    precalculated_rope,
-                    batch_dim.size(),
-                    command_buffer,
-                ).map_err(AttentionEncodeError::Backend)?;
+                let queries = self
+                    .prepare_kv_and_queries(
+                        &qkvg,
+                        &mut keys,
+                        &mut values,
+                        0,
+                        self.num_q_heads,
+                        precalculated_rope,
+                        batch_dim.size(),
+                        command_buffer,
+                    )
+                    .map_err(AttentionEncodeError::Backend)?;
 
                 let cache = self.ring_capacity.map_or_else(|| KVCacheView::full(0), |_| KVCacheView::ring(0, 0));
                 self.encode_bf16(&queries, &keys, &values, cache, gate, batch_dim, command_buffer)?
@@ -87,21 +91,23 @@ impl<B: Backend> Attention<B> {
             Some(MaybeMut::Mut(state)) => {
                 let cache = state.view();
                 match &mut state.kv {
-                    KVStorage::BF16 { keys, values, .. } => {
-                        let queries = self.prepare_kv_and_queries(
-                            &qkvg,
-                            keys.as_mut(),
-                            values.as_mut(),
-                            cache.prefix_len(),
-                            self.num_q_heads,
-                            precalculated_rope,
-                            batch_dim.size(),
-                            command_buffer,
-                        ).map_err(AttentionEncodeError::Backend)?;
+                    KVStorage::BF16(kv, _) => {
+                        let queries = self
+                            .prepare_kv_and_queries(
+                                &qkvg,
+                                kv.keys.as_mut(),
+                                kv.values.as_mut(),
+                                cache.prefix_len(),
+                                self.num_q_heads,
+                                precalculated_rope,
+                                batch_dim.size(),
+                                command_buffer,
+                            )
+                            .map_err(AttentionEncodeError::Backend)?;
                         self.encode_bf16(
                             &queries,
-                            keys.as_ref(),
-                            values.as_ref(),
+                            kv.keys.as_ref(),
+                            kv.values.as_ref(),
                             cache,
                             gate,
                             batch_dim,
@@ -109,14 +115,9 @@ impl<B: Backend> Attention<B> {
                         )?
                     },
                     KVStorage::Int8(kv, _) => {
-                        let queries = self.prepare_int8(
-                            &qkvg,
-                            Some(&mut *kv),
-                            cache,
-                            precalculated_rope,
-                            batch_dim,
-                            command_buffer,
-                        ).map_err(AttentionEncodeError::Backend)?;
+                        let queries = self
+                            .prepare_int8(&qkvg, Some(&mut *kv), cache, precalculated_rope, batch_dim, command_buffer)
+                            .map_err(AttentionEncodeError::Backend)?;
                         self.encode_int8(queries, kv, cache, gate, batch_dim, command_buffer)?
                     },
                 }
@@ -125,13 +126,14 @@ impl<B: Backend> Attention<B> {
             Some(MaybeMut::Const(state)) => {
                 let cache = state.view();
                 match &state.kv {
-                    KVStorage::BF16 { keys, values, .. } => {
-                        let queries =
-                            self.prepare_queries(&qkvg, precalculated_rope, batch_dim.size(), command_buffer).map_err(AttentionEncodeError::Backend)?;
+                    KVStorage::BF16(kv, _) => {
+                        let queries = self
+                            .prepare_queries(&qkvg, precalculated_rope, batch_dim.size(), command_buffer)
+                            .map_err(AttentionEncodeError::Backend)?;
                         self.encode_bf16(
                             &queries,
-                            keys.as_ref(),
-                            values.as_ref(),
+                            kv.keys.as_ref(),
+                            kv.values.as_ref(),
                             cache,
                             gate,
                             batch_dim,
@@ -139,8 +141,9 @@ impl<B: Backend> Attention<B> {
                         )?
                     },
                     KVStorage::Int8(kv, _) => {
-                        let queries =
-                            self.prepare_int8(&qkvg, None, cache, precalculated_rope, batch_dim, command_buffer).map_err(AttentionEncodeError::Backend)?;
+                        let queries = self
+                            .prepare_int8(&qkvg, None, cache, precalculated_rope, batch_dim, command_buffer)
+                            .map_err(AttentionEncodeError::Backend)?;
                         self.encode_int8(queries, kv, cache, gate, batch_dim, command_buffer)?
                     },
                 }
@@ -160,13 +163,13 @@ impl<B: Backend> Attention<B> {
     ) -> Result<(), B::Error> {
         self.projection.norm.encode_key_value(key_value.reborrow(), batch_dim, command_buffer);
         let prefix_len = state.view().prefix_len();
-        let KVStorage::BF16 { keys, values, .. } = &mut state.kv else {
+        let KVStorage::BF16(kv, _) = &mut state.kv else {
             panic!("projected K/V rows go to a BF16 KV cache");
         };
         self.prepare_kv_and_queries(
             key_value.as_ref(),
-            keys.as_mut(),
-            values.as_mut(),
+            kv.keys.as_mut(),
+            kv.values.as_mut(),
             prefix_len,
             0,
             Some(precalculated_rope),
@@ -188,19 +191,21 @@ impl<B: Backend> Attention<B> {
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<B::ScratchBuffer, AttentionEncodeError<B>> {
         let trie = Self::trie(batch_dim, command_buffer).map_err(AttentionEncodeError::Backend)?;
-        self.kernel.encode(
-            AttentionArguments {
-                queries,
-                keys,
-                values,
-                suffix_length: batch_dim.size(),
-                trie: trie.as_ref(),
-                sinks: self.sinks.as_ref(),
-                cache,
-                gate,
-            },
-            command_buffer,
-        ).map_err(AttentionEncodeError::Kernel)
+        self.kernel
+            .encode(
+                AttentionArguments {
+                    queries,
+                    keys,
+                    values,
+                    suffix_length: batch_dim.size(),
+                    trie: trie.as_ref(),
+                    sinks: self.sinks.as_ref(),
+                    cache,
+                    gate,
+                },
+                command_buffer,
+            )
+            .map_err(AttentionEncodeError::Kernel)
     }
 
     fn prepare_int8(
@@ -213,11 +218,11 @@ impl<B: Backend> Attention<B> {
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<(B::ScratchBuffer, B::ScratchBuffer), B::Error> {
         let suffix_length = batch_dim.size();
-        let padded = suffix_length.next_multiple_of(QUERY_TILE_ROWS);
+        let packed_rows = packed_query_rows(self.num_q_heads / self.num_groups, suffix_length);
         let mut query_codes =
-            command_buffer.allocate_scratch_for_shape(&[self.num_q_heads, padded, self.head_dim], DataType::I8)?;
+            command_buffer.allocate_scratch_for_shape(&[self.num_groups, packed_rows, self.head_dim], DataType::I8)?;
         let mut query_scales =
-            command_buffer.allocate_scratch_for_shape(&[self.num_q_heads, padded], DataType::BF16)?;
+            command_buffer.allocate_scratch_for_shape(&[self.num_groups, packed_rows], DataType::BF16)?;
         let (k_codes, k_scales, v_codes, v_scales) = match kv {
             Some(kv) => (
                 Some(kv.k_codes.as_mut()),
@@ -243,7 +248,7 @@ impl<B: Backend> Attention<B> {
             cache.prefix_len(),
             self.projection_dim,
             suffix_length,
-            padded,
+            packed_rows,
             command_buffer,
         );
         Ok((query_codes, query_scales))
@@ -259,18 +264,20 @@ impl<B: Backend> Attention<B> {
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<B::ScratchBuffer, AttentionEncodeError<B>> {
         let trie = Self::trie(batch_dim, command_buffer).map_err(AttentionEncodeError::Backend)?;
-        self.kernel.encode_int8(
-            Int8AttentionArguments {
-                query_codes: &query_codes,
-                query_scales: &query_scales,
-                kv,
-                suffix_length: batch_dim.size(),
-                trie: trie.as_ref(),
-                cache,
-                gate,
-            },
-            command_buffer,
-        ).map_err(AttentionEncodeError::Kernel)
+        self.kernel
+            .encode_int8(
+                Int8AttentionArguments {
+                    query_codes: &query_codes,
+                    query_scales: &query_scales,
+                    kv,
+                    suffix_length: batch_dim.size(),
+                    trie: trie.as_ref(),
+                    cache,
+                    gate,
+                },
+                command_buffer,
+            )
+            .map_err(AttentionEncodeError::Kernel)
     }
 
     fn trie(
