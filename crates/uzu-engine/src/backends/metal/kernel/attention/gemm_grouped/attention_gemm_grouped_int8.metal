@@ -56,7 +56,7 @@ METAL_FUNC ushort2 lane_index(const short2 position, const short row, const shor
 template <typename T, bool MASK_FREE, uint HEAD_DIM>
 VARIANTS(T, bfloat)
 VARIANTS(MASK_FREE, false, true)
-VARIANTS(HEAD_DIM, 256)
+VARIANTS(HEAD_DIM, 128, 256)
 KERNEL(AttentionGemmGroupedInt8)(
     const device int8_t* q_codes,
     const device T* q_scales,
@@ -78,7 +78,7 @@ KERNEL(AttentionGemmGroupedInt8)(
     const bool is_trie SPECIALIZE,
     const uint32_t num_kv_heads SPECIALIZE,
     threadgroup float p_exchange[2 * AttentionGemmGroupedInt8Layout<HEAD_DIM>::SLOT_FLOATS],
-    threadgroup ulong trie_masks[32],
+    threadgroup ulong row_masks[AttentionGemmGroupedInt8Layout<HEAD_DIM>::Grouped::BLOCK_ROWS],
     threadgroup uint4 query_stage[AttentionGemmGroupedInt8Layout<HEAD_DIM>::QUERY_STAGE_VECTORS],
     const ThreadContext thread_context,
     const uint tile_split_flat GROUPS(m_tiles * split_count),
@@ -183,33 +183,32 @@ KERNEL(AttentionGemmGroupedInt8)(
       uint(score_position.y) + uint(Ops::THREAD_ELEMENT_ROW_STRIDE)
   };
   const uint block_band_base = uint(band) * uint(Layout::TILE_ROWS);
-  // Causal or trie mask per row.
-  uint last_visible_key[MASK_FREE ? 1 : ROWS_PER_LANE];
+  // Per-row mask (trie ancestor bits or last visible key), kept in threadgroup memory to save registers.
   if (!MASK_FREE) {
+    ulong row_mask[ROWS_PER_LANE];
+    uint query_index[ROWS_PER_LANE];
     METAL_PRAGMA_UNROLL
     for (ushort r = 0; r < ROWS_PER_LANE; ++r) {
-      last_visible_key[r] = prefix_length + (row_base + band_rows[r]) % params.q_len;
+      query_index[r] = (row_base + band_rows[r]) % params.q_len;
+      row_mask[r] = is_trie ? 0ul : ulong(prefix_length + query_index[r]);
     }
-  }
-  if (!MASK_FREE && is_trie) {
-    ulong row_trie_mask[ROWS_PER_LANE] = {0ul, 0ul};
-    for (uint node_index = 0; node_index < trie_nodes; ++node_index) {
-      const TrieNode node = trie[node_index];
-      METAL_PRAGMA_UNROLL
-      for (ushort r = 0; r < ROWS_PER_LANE; ++r) {
-        const uint query_index = last_visible_key[r] - prefix_length;
-        if (query_index >= node.trie_start && query_index <= node.trie_end) {
-          row_trie_mask[r] |= (1ul << node_index);
+    if (is_trie) {
+      for (uint node_index = 0; node_index < trie_nodes; ++node_index) {
+        const TrieNode node = trie[node_index];
+        METAL_PRAGMA_UNROLL
+        for (ushort r = 0; r < ROWS_PER_LANE; ++r) {
+          if (query_index[r] >= node.trie_start && query_index[r] <= node.trie_end) {
+            row_mask[r] |= (1ul << node_index);
+          }
         }
       }
     }
     if (score_position.x == 0) {
       METAL_PRAGMA_UNROLL
       for (ushort r = 0; r < ROWS_PER_LANE; ++r) {
-        trie_masks[block_band_base + band_rows[r]] = row_trie_mask[r];
+        row_masks[block_band_base + band_rows[r]] = row_mask[r];
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
 
   const uint key_block_stride = uint(TILE_KEYS) * key_row_stride;
@@ -370,21 +369,19 @@ KERNEL(AttentionGemmGroupedInt8)(
 
       // Apply mask.
       if (!MASK_FREE && (is_tail_block || (key_base + uint(TILE_KEYS) > prefix_length))) {
-        ulong trie_row_masks[ROWS_PER_LANE] = {0ul, 0ul};
-        if (is_trie) {
-          METAL_PRAGMA_UNROLL
-          for (ushort r = 0; r < ROWS_PER_LANE; ++r) {
-            trie_row_masks[r] = trie_masks[block_band_base + band_rows[r]];
-          }
+        ulong row_mask[ROWS_PER_LANE];
+        METAL_PRAGMA_UNROLL
+        for (ushort r = 0; r < ROWS_PER_LANE; ++r) {
+          row_mask[r] = row_masks[block_band_base + band_rows[r]];
         }
         map_lane_rows(score, score_position, [&](ushort lane_row, short col, AccumType value) UZU_ALWAYS_INLINE {
           const uint key = key_base + uint(col);
           bool visible = key < key_length;
           if (is_trie) {
-            visible = visible &&
-                      (key < prefix_length || ((trie_row_masks[lane_row] >> ulong(key - prefix_length)) & 1ul) != 0ul);
+            visible =
+                visible && (key < prefix_length || ((row_mask[lane_row] >> ulong(key - prefix_length)) & 1ul) != 0ul);
           } else {
-            visible = visible && key <= last_visible_key[MASK_FREE ? 0 : lane_row];
+            visible = visible && key <= uint(row_mask[lane_row]);
           }
           return visible ? value : MASKED_SCORE;
         });

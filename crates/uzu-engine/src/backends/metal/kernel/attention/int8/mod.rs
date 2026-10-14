@@ -1,11 +1,14 @@
-use super::gemm_grouped::policy::{MAX_TRIE_SUFFIX, int8_splits};
+use super::gemm_grouped::{
+    block_rows,
+    policy::{self, MAX_TRIE_SUFFIX, int8_splits},
+};
 use crate::{
     backends::{
         common::{
             Backend, BufferMut, BufferRef, CommandBufferEncoding,
             kernel::{
                 AttentionKernelConfig, Int8AttentionArguments,
-                kv_layout::{QUERY_TILE_ROWS, TILE_KEYS, packed_query_rows},
+                kv_layout::{TILE_KEYS, packed_query_rows},
             },
         },
         metal::{
@@ -20,9 +23,6 @@ use crate::{
     data_type::DataType,
 };
 
-/// Grouped rows of one threadgroup: two bands of [`QUERY_TILE_ROWS`].
-const BLOCK_ROWS: u32 = 2 * QUERY_TILE_ROWS;
-
 pub(super) struct Int8Attention {
     config: AttentionKernelConfig,
     mask_free: AttentionGemmGroupedInt8MetalKernel,
@@ -36,12 +36,7 @@ impl Int8Attention {
         config: &AttentionKernelConfig,
         context: &MetalContext,
     ) -> bool {
-        context.supports_mxu
-            && config.head_dim == 256 // TODO: support + tune other head_dim
-            && config.is_causal
-            && config.data_type == DataType::BF16
-            && !config.has_sinks
-            && config.sliding_window_size.is_none()
+        policy::is_supported(config, context) && config.is_causal
     }
 
     pub fn new(
@@ -103,8 +98,9 @@ impl Int8Attention {
         let gqa_factor = num_q_heads / num_groups;
         let grouped_rows = gqa_factor * suffix_length;
         let packed_rows = packed_query_rows(gqa_factor, suffix_length);
-        let m_tiles = packed_rows.div_ceil(BLOCK_ROWS);
-        let split_rows = num_groups * m_tiles * BLOCK_ROWS;
+        let block_rows = block_rows(head_dim);
+        let m_tiles = packed_rows.div_ceil(block_rows);
+        let split_rows = num_groups * m_tiles * block_rows;
         let num_splits = int8_splits(split_rows, head_dim, suffix_length, kv_length);
 
         let rows = split_rows * num_splits;
@@ -171,7 +167,7 @@ impl Int8Attention {
             gate,
             params,
             grouped_rows,
-            BLOCK_ROWS,
+            block_rows,
             m_tiles,
             num_groups,
             1,
