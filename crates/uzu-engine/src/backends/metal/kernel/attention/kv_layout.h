@@ -9,8 +9,7 @@
 //   k_scales bf16   [key block][kv head][key in block]                             a prefix of keys is a byte prefix
 //   v_scales bf16   [key block][kv head][key in block]
 // clang-format on
-// Sparse planes are not zeroed. Writers store a scale > 0, and readers treat a scale below MIN_VALUE_SCALE (zero,
-// negative, NaN, denormal) as never written.
+// Sparse pages are not zeroed, so a scale below MIN_VALUE_SCALE marks a slot never written.
 
 namespace uzu::kv_layout {
 
@@ -19,7 +18,6 @@ UZU_CONST uint TILE_DIMS = 16;
 UZU_CONST uint FRAGMENT_BYTES = TILE_KEYS * TILE_DIMS;
 UZU_CONST uint KV_SLICE_DIMS = 64;
 UZU_CONST int KV_V_CODE_BIAS = 128;
-/// Smallest V scale treated as written: keeps 1 / scale finite for any garbage in a never-written slot.
 UZU_CONST float MIN_VALUE_SCALE = 1e-30f;
 
 /// The lane whose relaxed-MXU `get_position` is `(4 * channel_group, row_in_group)` (inverse of the fragment lane map).
