@@ -93,7 +93,13 @@ impl MatmulMetalKernel {
         let all_bf16 = weights_data_type == DataType::BF16
             && input_data_type == DataType::BF16
             && output_data_type == DataType::BF16;
-        let problem = GemmProblem::new(*shape, weights_data_type, output_data_type, supports_mxu, apple_gpu_family);
+        let problem = GemmProblem::new(
+            *shape,
+            weights_data_type,
+            output_data_type,
+            supports_mxu && !gemm::requires_simdgroup(weights_data_type, input_data_type),
+            apple_gpu_family,
+        );
         if shape.b_is_trellis {
             return MatmulDispatch::Gemm(problem.select_plan());
         }
