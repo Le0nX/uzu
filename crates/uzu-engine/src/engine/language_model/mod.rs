@@ -18,6 +18,7 @@ use crate::{
 };
 pub use crate::{config::model::generation::GenerationConfig, utils::strict_serde::Unsupported};
 
+pub mod candidate_score;
 pub mod state;
 pub mod stream;
 

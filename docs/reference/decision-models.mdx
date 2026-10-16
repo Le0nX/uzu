@@ -1,0 +1,230 @@
+---
+title: Typed decision inference and architecture adapters
+---
+
+`uzu-engine` exposes a shared `state + questions -> probabilities` contract through architecture adapters. Julia/Laya are the first supported graph family: their adapter scores option marker positions in one encoder/head forward pass.
+
+Convert a local Julia or Laya checkpoint with the matching lalamo change:
+
+```sh
+lalamo convert-decision /path/to/checkpoint /path/to/converted --dtype bfloat16
+```
+
+The output contains `config.json`, `model.safetensors`, `tokenizer.json` and `decision_policy.json`. The policy preserves raw checkpoint temperatures. Serving applies Laya's native temperature clamp; Julia uses unit temperatures. Training-only action heads are excluded.
+
+Run the JSON-lines Rust example:
+
+```sh
+cargo run -p uzu-engine --example decision -- /path/to/converted
+```
+
+For a CPU build:
+
+```sh
+UZU_BACKEND=cpu cargo run -p uzu-engine --no-default-features --features cpu --example decision -- /path/to/converted
+```
+
+Send one JSON object per line, for example:
+
+```json
+{"state":"Sample A: stage E8.5; genotype Wildtype.","questions":{"stage":{"type":"choice","instructions":"Which stage is explicitly stated for sample A?","criteria":{"e8":"E8.5","e10":"E10.5","missing":"not stated"}}}}
+```
+
+The example returns raw logits, probabilities, the effective temperature and the number of input tokens for each question. `noul` additionally returns the probability of `true`. Raw-token inputs (`input_ids`, `markers`, `question_type`) are available for parity diagnostics.
+
+The public Rust API is `Engine::load_decision_model` and `DecisionModel::score(&[u32], question_type, &[marker_positions])`. The default compute type is BF16. F32 diagnostics require an F32 export and `--f32` in the example.
+
+Input preparation rejects context overflow, oversized option descriptions, question-head overflow and reserved marker injection. It never shortens source evidence. Unsupported question extensions are rejected. For structured floating-point values, serialize the state/criterion to text in the source application first, so Python and Rust number formatting cannot silently change tokenization. Native Laya features such as custom `labels` and `option_order` are outside this initial wire interface.
+
+This change adds the core Rust API and conversion path. It does not add legacy Python/Swift chat or classification sessions for decision models. The existing classifier API retains its pooling and fixed-label semantics.
+
+Metal source changes require the Apple Metal toolchain to compile. CPU correctness validation does not establish Metal correctness or performance; run the same converted-checkpoint fixtures on Metal before deployment.
+
+## Shared typed decision interface
+
+The public contract is `DecisionRequest { state, questions } -> DecisionResponse { answers }`. It is independent of the encoder and of marker token layouts. The first question types are `choice`, ordered `score`, and `noul`. Every answer contains probabilities over exactly the options in its question.
+
+`engine::typed_decision::DecisionAdapter` is the runtime extension point. An adapter owns tokenization, state serialization, model execution and model-specific scoring. It returns either logits with an explicit effective temperature, or native probabilities. `TypedDecisionEngine` checks question identities, question types, option identities, lengths, finite values and normalized distributions. Native probabilities are not passed through a second softmax or silently repaired. The common layer does not invent a confidence or action probability.
+
+`option_ids` gives the positional order for logits; consumers must not infer that order from a serialized probability map. Boolean probability is read from the option named `true`.
+
+The first runtime adapter is `engine::modernbert_marker::ModernBertMarkerAdapter`. Its graph is `modernbert_marker_v1`; Julia/Laya release policies identify encoding/calibration separately (`julia_v1` / `laya_v1`). Sequence budgets and reserved marker rules belong to this adapter, rather than to the generic interface.
+
+```rust
+let adapter = ModernBertMarkerAdapter::new(model, policy)?;
+let decisions = TypedDecisionEngine::new(adapter);
+let response = decisions.decide(&request)?;
+```
+
+## Checkpoint compatibility and extensions
+
+| Checkpoint | Current path | Additional work |
+| --- | --- | --- |
+| Julia/Laya checkpoint using the supported backbone, head, weight names, tokenizer and policy | Built-in checkpoint adapters and `ModernBertMarkerAdapter` | Pin revision and verify numerical parity |
+| Compatible fine-tune retaining that contract | Reuse the same importer and runtime | Recheck tensors, tokenizer, policy, parity and calibration |
+| Different file layout for the same graph and encoding | Implement `DecisionCheckpointAdapter`, register it in `DecisionCheckpointRegistry`, pass it to lalamo import/export | Validate the layout mapping and numerical equivalence |
+| Different encoder, decision head or decoder-based option scorer | Implement a graph converter and a runtime `DecisionAdapter` | Support the required operations and validate its scoring semantics |
+| Model exposing native option probabilities | Implement a `DecisionAdapter` returning `DecisionValues::Probabilities` | Verify the option mapping and calibration |
+
+The lalamo marker registry is explicit and independent of Hugging Face repository names. Unknown and ambiguous checkpoints fail with `UnsupportedDecisionArchitectureError`. Registration of an architecture identifier does not implement its graph. The marker exporter builds `modernbert_marker_v1`; the code-readout and causal-token families use separate exporters described below.
+
+This is not an automatic loader for every open typed decision model on Hugging Face. Jev-like and other decision-model names describe the intended class of use cases, not additional tested checkpoints. Matching `state + questions -> probabilities` is not evidence of matching architecture, numerical behavior, task quality or calibration. Those must be checked for every new supported checkpoint.
+
+A singleton option with probability 1 is valid in the generic contract. Minimum/maximum option counts of a particular checkpoint remain adapter rules; the currently tested marker wire path requires at least two options, with Julia's maximum of 20.
+
+## Local validation status
+
+Independent CPU F32 fixtures cover Julia, Laya-512 and Laya-1024: 30 calls over 18 distinct questions, including raw-token and typed request paths, with maximum absolute probability difference below `2.8e-6` against PyTorch. The shared adapter wrapper also passes a real Julia request containing all three question types. These are correctness fixtures, not a VE26 quality evaluation.
+
+The earlier Julia all-BF16 CPU fixture had a maximum probability difference of `0.11277`, outside the `0.02` tolerance. That reference precision policy differs from the author's CUDA autocast policy. It is not a parity result for the Qwen-based families below. Julia/Laya are outside the current selected-model acceptance set; keeping their adapter does not establish their R&D task quality.
+
+## Qwen code-readout adapter (d3)
+
+`qwen_code_readout_v1` / `d3_code_v1` implements an independent FP32 code
+readout over a BF16 Qwen3.5 text backbone. This is not autoregressive generation.
+The pinned d3 graph uses bidirectional full attention and causal DeltaNet layers;
+a causal language-model forward is not an equivalent reference.
+
+Whole-prompt execution prepares sparse KV pages before using them. It completes
+one transformer layer at a time and releases unused allocations after GPU work
+finishes. Long causal DeltaNet layers carry their convolution and recurrent state
+across aligned execution tiles. Long attention layers prepare K/V for the entire
+prompt, then evaluate query tiles against **all** keys, including later tokens.
+Pointwise MLP work is tiled independently. These tiles are dispatch geometry,
+not truncation, a sliding attention window, or a response-token limit.
+
+This execution path rejects KV sharing, eager encoder attention, per-layer
+embeddings, embedding normalization, and convolutional transformer branches.
+Those architectures require their own implementation; the shared decision API
+does not imply support for arbitrary checkpoints.
+
+Validation on the pinned full d3 checkpoint used four frozen native BF16
+questions (112–226 tokens), with maximum probability difference 0.010182 at a
+0.02 tolerance. All 64 residual layer outputs were inspected on a 226-token
+control. An eight-layer reduced bidirectional graph at 5,001 tokens tests the
+long execution path against native CPU BF16 (maximum difference 0.001987).
+A full-checkpoint 19,311-token request completed on Metal. This last run verifies
+execution, not full-checkpoint long-context numerical parity. These results do
+not establish VE26 task quality or universal all-input parity.
+
+## Additional Qwen decision release policies
+
+`engine::code_readout::CodeReadoutAdapter` serves the common
+`qwen_code_readout_v1` graph with explicit release policies. The old
+`engine::d3` type aliases remain available for source compatibility.
+
+| Release policy | Checkpoints admitted by the converter | Readout |
+| --- | --- | --- |
+| `d3_code_v1` | d3 27B, d3-mini 4B, d3-flash 9B | Independent FP32 255-row head over BF16 hidden states |
+| `pplx_code_v1` | Perplexity Decider v1.1 27B | Independent BF16 255-row head; BF16 output rounding before softmax |
+| `nimble_v3` on `causal_token_readout_v1` | Bespoke Nimble 9B v3 and its pinned Qwen3.5-9B base | Causal decoder, native vocabulary candidate tokens, merged BF16 LoRA |
+
+d3 and Perplexity preserve their own prompt text, state serialization,
+option formatting and temperature. A matching backbone alone is insufficient:
+the native policy must match too. In particular, Perplexity retains native
+empty/null state behavior and its own final instruction. Structured floating
+point values are rejected by this wire path; pass the original source text when
+exact JSON number formatting matters.
+
+The converters are explicit local-checkpoint commands:
+
+```sh
+lalamo convert-d3 /pinned/d3-checkpoint /new/uzu-output --revision EXACT_COMMIT
+lalamo convert-perplexity /pinned/pplx-checkpoint /new/uzu-output --revision EXACT_COMMIT
+lalamo convert-nimble /pinned/qwen-base /pinned/nimble-adapter /pinned/prompt-sources /new/uzu-output
+```
+
+Conversion verifies the release contract and required source hashes. The release
+revision, native prompt/codebook and converted artifact hashes must travel with
+the model. d3/Perplexity weights use Apache-2.0. Nimble's adapter and prompt source
+use CC-BY-NC-4.0; its Qwen base uses Apache-2.0. These are separate from the MIT
+uzu/lalamo code license. Native prompt strings stay in separately licensed model
+artifacts rather than being embedded in the engine.
+
+Nimble's merge is a numerical transformation, not an equivalence assumption.
+Validate native unmerged PEFT, native merged BF16 and uzu against one another.
+The selected-model fixtures observed merge delta `0.017224`, uzu versus merged
+delta `0.004530`, and uzu versus unmerged delta `0.012694`, all within `0.02`.
+These four short questions do not establish all-input parity or task quality.
+
+Candidate-token inference selects actual vocabulary rows rather than generating
+letter tokens. Metal's existing gathered GEMV kernel also handles one to three
+candidate rows; its dispatch must not fall back to GEMM, which lacks gather.
+Arithmetic tests cover 1/2/3/27/255 candidates, aligned and tail K dimensions,
+and per-input gather ordering. This change is independent of the separate
+BF16-input × FP32-weight matmul patch.
+
+Current support is text only. Images, another backbone, a different decision
+head, altered codebook or new prompt semantics require explicit adapter work and
+native-reference validation. Compatible checkpoints reuse the corresponding
+graph after those checks. No automatic quality or calibration claim follows
+from a common API.
+
+## Resident worker and local typed service
+
+`examples/typed_decision_worker.rs` loads one converted checkpoint and invokes the
+same `TypedDecisionEngine`. It emits a ready event after loading, then one typed
+response per input JSON line. This is a transport protocol written by code, not
+JSON generated by a language model. The worker selects explicit architecture
+adapters for `modernbert_marker_v1`, `qwen_code_readout_v1`, and
+`causal_token_readout_v1`; a different architecture needs an implementation.
+Compatible checkpoints reuse their architecture path after validation.
+
+```sh
+cargo build -p uzu-engine --example typed_decision_worker \
+  --no-default-features --features cpu,metal
+PYTHONPATH=tools python -m decision_service \
+  --config /absolute/path/service-config.json \
+  --journal /absolute/path/inference-receipts --port 52280
+```
+
+The Python transport uses the standard library; **all inference is uzu**. It binds
+only to `127.0.0.1`, accepts configured model IDs rather than client-supplied paths,
+and rejects browser-origin POST requests. The Rust worker owns tokenization,
+context validation, graph execution and normalized probability output.
+
+Endpoints:
+
+| Method / path | Contract |
+| --- | --- |
+| `GET /v1/models` | Configured model IDs, pinned manifests, precision/backend, validation notes and execution capabilities |
+| `GET /healthz` | Model lifecycle state, worker PID/aliveness, observed RSS/physical footprint |
+| `POST /v1/decisions` | `{request_id, model, binding, state, questions}` → status, typed response or error, telemetry and receipt |
+| `POST /v1/models/load` | `{model}` → loaded worker; a model switch drains and unloads the previous worker |
+| `POST /v1/models/unload` | `{}` → drain current inference, close worker input, reap process and release GPU lock |
+
+`binding.bundle_hash` must identify the configured manifest. Other binding fields
+are opaque caller metadata, echoed and covered by the receipt; they do not grant
+research permissions. The service verifies SHA-256 pins for config, tokenizer,
+policy and converted weights before loading. Verified files are cached by inode,
+size and modification/change timestamps within the process. Model files must be
+operator-owned immutable artifacts. Engine binary, model revision, weight license
+and runtime code license are recorded separately.
+
+`request_id` is durable within the technical receipt directory. The same ordered
+payload returns the original receipt without another inference; changing its
+payload/order is a collision. A pending receipt after interruption returns
+`outcome_unknown`, requiring explicit reconciliation rather than automatic replay.
+These technical receipts are not a second research-state owner or action ledger.
+
+Several questions share one HTTP request but execute sequentially. Cross-request
+GPU batching, shared-prefix KV reuse and multiple simultaneous resident models
+are **not implemented**. The current process lifecycle avoids hidden model copies.
+A resident Metal worker holds the configured advisory GPU lock until explicit
+unload/switch/shutdown. CPU routes do not acquire that GPU lock. No token output
+limit, request generation timeout, power gate or silent input truncation is added.
+Checkpoint context/head constraints remain architectural validity checks.
+
+Context overflow is `context_exceeded` with actual and maximum token counts and
+`truncated:false`. Invalid outputs, load failures and worker exits produce errors,
+not repaired or invented distributions. Cold/load time, inference time, queue
+time, memory and power mode are observations. Sampled request memory and lifetime
+peak memory have distinct names.
+
+Local acceptance used full d3 27B on Metal through HTTP and the Swarm model-lab
+DTOs: a two-question request reproduced the saved probabilities exactly, durable
+replay avoided inference, and explicit unload reaped the worker. This is component
+integration evidence, not a closed-loop R&D efficacy result. The F32 marker route
+currently requires the explicit CPU backend: Metal lacks the F32/F32
+`AttentionPrepare` specialization. Julia BF16 parity remains a separate known
+gap; the service does not silently switch its precision or backend.

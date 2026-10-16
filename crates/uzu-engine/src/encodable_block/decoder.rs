@@ -136,12 +136,79 @@ impl<B: Backend> Decoder<B> {
         self.transformer.create_empty_state(max_context_length, context)
     }
 
+    pub(crate) fn encode_code_prompt(
+        &self,
+        input: &[u32],
+        batch: &BatchTopology,
+        context: &B::Context,
+    ) -> Result<B::GlobalBuffer, Box<dyn std::error::Error>> {
+        use crate::backends::common::{
+            Buffer, CommandBufferEncoding, CommandBufferExecutable, CommandBufferPending, Context,
+        };
+        assert!(self.embedding_norm.is_none() && self.per_layer_embedding.is_none());
+        context.release_cached_buffers();
+        let mut cb = context.create_command_buffer(Some("code decision embedding"), None).map_err(|e| e.to_string())?;
+        let ids = cb.allocate_constant_from_slice(input).map_err(|e| e.to_string())?;
+        let hidden = self.embedding.encode_lookup(&ids, batch.size(), &mut cb).map_err(|e| e.to_string())?;
+        let mut saved = context.create_buffer(hidden.size()).map_err(|e| e.to_string())?;
+        cb.encode_copy(&hidden, &mut saved);
+        drop(hidden);
+        drop(ids);
+        cb.end_encoding().submit().wait_until_completed().map_err(|e| e.to_string())?;
+        self.transformer.encode_code_prompt(saved, batch, context)
+    }
+
     pub fn encode(
         &self,
         token_ids: impl BufferRef<Backend = B>,
         batch_dim: &BatchTopology,
         output_range: Option<Range<u32>>,
         hidden_feature_layer_indices: Option<&[u32]>,
+        state: &mut TransformerState<B>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<DecoderEncodeOutput<B>, DecoderError<B>> {
+        self.encode_inner(
+            token_ids,
+            batch_dim,
+            output_range,
+            hidden_feature_layer_indices,
+            None,
+            true,
+            state,
+            command_buffer,
+        )
+    }
+
+    /// Score only the requested vocabulary rows at the final prompt position.
+    /// This is a decoder forward pass, without sampling or generated tokens.
+    pub fn encode_candidates(
+        &self,
+        token_ids: impl BufferRef<Backend = B>,
+        batch_dim: &BatchTopology,
+        candidates: &B::ConstantBuffer,
+        state: &mut TransformerState<B>,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<DecoderEncodeOutput<B>, DecoderError<B>> {
+        self.encode_inner(
+            token_ids,
+            batch_dim,
+            Some((batch_dim.size() - 1..batch_dim.size()).into()),
+            None,
+            Some(candidates),
+            true,
+            state,
+            command_buffer,
+        )
+    }
+
+    fn encode_inner(
+        &self,
+        token_ids: impl BufferRef<Backend = B>,
+        batch_dim: &BatchTopology,
+        output_range: Option<Range<u32>>,
+        hidden_feature_layer_indices: Option<&[u32]>,
+        candidates: Option<&B::ConstantBuffer>,
+        readout: bool,
         state: &mut TransformerState<B>,
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<DecoderEncodeOutput<B>, DecoderError<B>> {
@@ -172,13 +239,13 @@ impl<B: Backend> Decoder<B> {
             command_buffer,
         )?;
 
-        let logits = if let Some(output_range) = output_range {
+        let logits = if let Some(output_range) = output_range.filter(|_| readout) {
             let output = transformer_output.output.as_ref().expect("decoder output range requires transformer output");
             Some(self.embedding.encode_readout(
                 output,
                 output_range.end - output_range.start,
-                self.embedding.vocab_size(),
-                None::<&B::ScratchBuffer>,
+                candidates.map_or(self.embedding.vocab_size(), |ids| ids.as_slice::<u32>().len() as u32),
+                candidates,
                 true,
                 command_buffer,
             )?)

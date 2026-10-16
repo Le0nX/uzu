@@ -32,7 +32,7 @@ fn apply_rope<ElementT: DataTypeRepr + Float>(
 }
 
 #[kernel(AttentionPrepare)]
-#[variants(ElementT, bf16)]
+#[variants(ElementT, f32, bf16)]
 #[variants(RopeT, f32)]
 pub fn attention_prepare<ElementT: DataTypeRepr + Float, RopeT: DataTypeRepr + Float>(
     qkvg: *const ElementT,

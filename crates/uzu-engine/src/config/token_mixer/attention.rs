@@ -26,6 +26,10 @@ pub struct AttentionConfig {
     pub has_gate: bool,
     pub normalize_values: bool,
     pub is_kv_sharing: bool,
+    /// Preserve PyTorch eager BF16 QK/scale/softmax rounding for stateless
+    /// bidirectional marker encoders. The default keeps existing fused paths.
+    #[serde(default)]
+    pub bf16_eager: bool,
 }
 
 impl AttentionConfig {

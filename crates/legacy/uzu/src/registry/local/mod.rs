@@ -95,14 +95,16 @@ impl Registry {
         let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| RegistryError::UnableToGetModels {
             message: format!("Invalid local model path: {}", path.display()),
         })?;
-        let specialization = resolve_model_type(path)
-            .map(|model_type| match model_type {
-                ModelType::LanguageModel => ModelSpecialization::Chat {},
-                ModelType::Classifier => ModelSpecialization::Classification {},
-            })
-            .map_err(|error| RegistryError::UnableToGetModels {
-                message: format!("Unable to resolve specialization for {}: {error}", path.display()),
-            })?;
+        let model_type = resolve_model_type(path).map_err(|error| RegistryError::UnableToGetModels {
+            message: format!("Unable to resolve specialization for {}: {error}", path.display()),
+        })?;
+        let specialization = match model_type {
+            ModelType::LanguageModel => ModelSpecialization::Chat {},
+            ModelType::Classifier => ModelSpecialization::Classification {},
+            ModelType::Decision => return Err(RegistryError::UnableToGetModels {
+                message: "Marker decision models use uzu_engine::Engine::load_decision_model; legacy chat/classification sessions do not support them".to_string(),
+            }),
+        };
         Ok(Model::external(
             name.to_string(),
             self.identifier(),

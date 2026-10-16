@@ -2,7 +2,7 @@ use half::{bf16, f16};
 use num_traits::Float;
 use uzu_engine_macros::kernel;
 
-use crate::data_type::DataTypeRepr;
+use crate::data_type::{DataType, DataTypeRepr};
 
 #[kernel(Softmax)]
 #[variants(T, f32, f16, bf16)]
@@ -37,19 +37,26 @@ pub fn softmax<T: DataTypeRepr + Float>(
             } else {
                 0.0
             };
+            let mut partial_sums = [0.0f32; 4];
             for i in 0..row_length as usize {
                 let p = (unsafe { *values.add(row_offset + i) }.to_f32().unwrap() - max_value).exp();
-                sum_exp += p;
-                unsafe {
-                    *values.add(row_offset + i) = T::from(p).unwrap();
+                if T::data_type() == DataType::BF16 && !has_sinks {
+                    partial_sums[i % 4] += p;
+                } else {
+                    sum_exp += p;
                 }
+            }
+            if T::data_type() == DataType::BF16 && !has_sinks {
+                sum_exp = (partial_sums[0] + partial_sums[1]) + (partial_sums[2] + partial_sums[3]);
             }
 
             let inv = 1.0 / sum_exp;
             for i in 0..row_length as usize {
                 unsafe {
-                    let p = *values.add(row_offset + i);
-                    *values.add(row_offset + i) = T::from(p.to_f32().unwrap() * inv).unwrap();
+                    // Round the normalized probability once, as the Metal
+                    // implementation does; never round the numerator first.
+                    let x = (*values.add(row_offset + i)).to_f32().unwrap();
+                    *values.add(row_offset + i) = T::from((x - max_value).exp() * inv).unwrap();
                 }
             }
         }

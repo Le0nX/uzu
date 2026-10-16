@@ -232,12 +232,18 @@ impl<B: Backend> MixerState<B> for AttentionState<B> {
         context_length: u32,
         suffix_length: u32,
     ) -> Result<(), B::Error> {
-        assert!(suffix_length <= ATTENTION_SUFFIX_CAPACITY, "suffix exceeds capacity");
+        // A whole noncausal prompt may exceed the decoder's usual 1024-token
+        // append reserve. Its fresh cache was allocated with max_context_length;
+        // validate the actual allocation instead of an unrelated chunk size.
+        let elements_required =
+            self.cache.required_prefix_len(context_length).checked_add(suffix_length).expect("KV length overflow");
+        let bytes_required = size_for_shape(&[elements_required, self.element_dim], self.data_type);
+        assert!(
+            bytes_required <= self.keys.size() && bytes_required <= self.values.size(),
+            "KV request exceeds allocated capacity"
+        );
 
         if self.is_sparse {
-            let elements_required = self.cache.required_prefix_len(context_length) + suffix_length;
-            let bytes_required = size_for_shape(&[elements_required, self.element_dim], self.data_type);
-
             let keys = (self.keys.as_mut() as &mut dyn Any).downcast_mut::<B::SparseBuffer>().unwrap();
             let values = (self.values.as_mut() as &mut dyn Any).downcast_mut::<B::SparseBuffer>().unwrap();
 

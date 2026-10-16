@@ -215,6 +215,10 @@ impl Context for MetalContext {
         PoolAllocator::new()
     }
 
+    fn release_cached_buffers(&self) {
+        self.block_allocator.release_cached();
+    }
+
     fn peak_memory_usage(&self) -> Option<usize> {
         Some(self.peak_memory_usage.load(Ordering::Relaxed))
     }

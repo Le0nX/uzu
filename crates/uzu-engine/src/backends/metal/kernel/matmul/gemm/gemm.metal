@@ -42,7 +42,10 @@ template <
 VARIANTS(AT, bfloat, float)
 VARIANTS(BT, bfloat, float)
 VARIANTS(DT, bfloat, float)
-CONSTRAINT(BT != "float" || (AT == "float" && DT == "float"))
+// Dense FP32 weights support BF16 inputs without rounding the weights to BF16.
+// The new combination uses SIMD-group MMA with FP32 accumulation and result.
+// Keep the existing MXU variants: their relaxed arithmetic rounds FP32 operands.
+CONSTRAINT(BT != "float" || (DT == "float" && (AT == "float" || !USE_MXU)))
 VARIANTS(
     GEMM_TILING,
     GemmTiling::Tile8x32x32_Simdgroups1x1,

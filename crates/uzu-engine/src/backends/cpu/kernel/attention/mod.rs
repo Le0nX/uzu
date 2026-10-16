@@ -3,6 +3,7 @@ use crate::backends::common::Backend;
 pub mod ancestor_attention;
 pub mod attention_prepare;
 pub mod attention_single_pass;
+pub mod eager;
 pub mod kv_cache_update;
 pub mod qkv_norm;
 pub mod sigmoid_gate;

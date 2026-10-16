@@ -5,7 +5,8 @@ use thiserror::Error;
 
 use crate::{
     backends::common::{
-        Backend, Buffer, BufferRef, CommandBuffer, CommandBufferEncoding, Kernels, kernel::TensorAddScaleKernel,
+        Backend, Buffer, BufferMut, BufferRef, CommandBuffer, CommandBufferEncoding, Kernels,
+        kernel::TensorAddScaleKernel,
     },
     config::{rope::AnyRoPEConfig, transformer::TransformerConfig},
     data_type::DataType,
@@ -100,6 +101,7 @@ pub enum TransformerEncodeError<B: Backend> {
 
 pub struct Transformer<B: Backend> {
     ropes: Box<[AnyRoPEConfig]>,
+    bf16_rope_tables: bool,
     layers: Box<[(TransformerLayer<B>, Option<usize>)]>,
     output_norm: Normalization<B>,
     model_dim: u32,
@@ -150,7 +152,11 @@ impl<B: Backend> Transformer<B> {
             transformer_config.model_dim,
             data_type,
             output_norm_hadamard_factors,
-            ShortcutMode::Add,
+            if num_layers == 0 {
+                ShortcutMode::None
+            } else {
+                ShortcutMode::Add
+            },
             PostLayerScalar::None,
             &transformer_config.output_norm_config,
             &parameter_tree.subtree("output_norm"),
@@ -162,11 +168,19 @@ impl<B: Backend> Transformer<B> {
 
         Ok(Self {
             ropes: ropes.into_boxed_slice(),
+            bf16_rope_tables: false,
             layers,
             output_norm,
             model_dim: transformer_config.model_dim,
             residual_add,
         })
+    }
+
+    /// ModernBERT casts rotary tables to the activation dtype before applying
+    /// rotations. Other transformer families retain the existing F32 tables.
+    pub fn with_bf16_rope_tables(mut self) -> Self {
+        self.bf16_rope_tables = true;
+        self
     }
 
     fn capture_residual(
@@ -235,6 +249,195 @@ impl<B: Backend> Transformer<B> {
         })
     }
 
+    /// Synchronous whole-prompt execution for the independent code-readout graph.
+    /// Every layer still sees every token; only temporary allocation lifetimes
+    /// change. Keeping just one layer's KV/state live avoids a prompt-length-
+    /// dependent accumulation of wired Metal memory across all layers.
+    fn encode_code_attention_layer(
+        &self,
+        layer: &TransformerLayer<B>,
+        attention: &crate::encodable_block::mixer::attention::Attention<B>,
+        input: &B::GlobalBuffer,
+        n: u32,
+        rope_index: Option<usize>,
+        context: &B::Context,
+    ) -> Result<B::GlobalBuffer, Box<dyn std::error::Error>> {
+        use crate::backends::common::{CommandBufferExecutable, CommandBufferPending, Context};
+        let row_bytes = input.size() / n as usize;
+        let mut normalized = context.create_buffer(input.size()).map_err(|e| e.to_string())?;
+        let mut cb = context.create_command_buffer(Some("code attention pre norm"), None).map_err(|e| e.to_string())?;
+        if let Some(norm) = &layer.pre_mixer_norm {
+            let mut shortcut = cb.allocate_scratch(input.size()).map_err(|e| e.to_string())?;
+            cb.encode_fill(&mut shortcut, 0);
+            let out = norm.encode(input, 0, n, Some(&mut shortcut), &mut cb).map_err(|e| e.to_string())?;
+            cb.encode_copy(&out, &mut normalized);
+            drop(out);
+        } else {
+            cb.encode_copy(input, &mut normalized);
+        }
+        cb.end_encoding().submit().wait_until_completed().map_err(|e| e.to_string())?;
+        let attended = attention.encode_code_prompt(
+            &normalized,
+            n,
+            rope_index.map(|i| &self.ropes[i]),
+            self.bf16_rope_tables,
+            context,
+        )?;
+        drop(normalized);
+        let mut result = context.create_buffer(input.size()).map_err(|e| e.to_string())?;
+        for start in (0..n).step_by(4096) {
+            let count = (n - start).min(4096);
+            let lo = start as usize * row_bytes;
+            let hi = (start + count) as usize * row_bytes;
+            context.release_cached_buffers();
+            let mut cb = context
+                .create_command_buffer(Some("code attention pointwise MLP tile"), None)
+                .map_err(|e| e.to_string())?;
+            let mut hidden = cb.allocate_scratch(hi - lo).map_err(|e| e.to_string())?;
+            cb.encode_copy(attended.subrange(lo..hi), &mut hidden);
+            let mut shortcut = cb.allocate_scratch(hi - lo).map_err(|e| e.to_string())?;
+            cb.encode_copy(input.subrange(lo..hi), &mut shortcut);
+            if let Some(norm) = &layer.post_mixer_norm {
+                hidden = norm
+                    .encode(&hidden, 0, count, None::<&mut B::ScratchBuffer>, &mut cb)
+                    .map_err(|e| e.to_string())?;
+            }
+            let norm = layer
+                .pre_mlp_norm
+                .encode(&hidden, 0, count, Some(&mut shortcut), &mut cb)
+                .map_err(|e| e.to_string())?;
+            drop(hidden);
+            let mut hidden = layer.mlp.encode(norm, count, &mut cb).map_err(|e| e.to_string())?;
+            if let Some(norm) = &layer.post_mlp_norm {
+                hidden = norm
+                    .encode(&hidden, 0, count, None::<&mut B::ScratchBuffer>, &mut cb)
+                    .map_err(|e| e.to_string())?;
+            }
+            let combined = self.capture_residual(&shortcut, &hidden, count, &mut cb).map_err(|e| e.to_string())?;
+            cb.encode_copy(&combined, result.subrange_mut(lo..hi));
+            drop(combined);
+            drop(hidden);
+            drop(shortcut);
+            cb.end_encoding().submit().wait_until_completed().map_err(|e| format!("attention MLP {start}: {e}"))?;
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn encode_code_prompt(
+        &self,
+        mut input: B::GlobalBuffer,
+        batch: &BatchTopology,
+        context: &B::Context,
+    ) -> Result<B::GlobalBuffer, Box<dyn std::error::Error>> {
+        use crate::backends::common::{CommandBufferExecutable, CommandBufferPending, Context};
+        let n = batch.size();
+        let positions = batch.heights().collect::<Vec<_>>();
+        let row_bytes = input.size() / n as usize;
+        for (layer, rope_index) in self.layers.iter() {
+            assert!(layer.kv_source_layer_index.is_none() && layer.ple_projection.is_none());
+            context.release_cached_buffers();
+            if n >= 4352
+                && let Some(attention) = (layer.mixer.as_ref() as &dyn std::any::Any)
+                    .downcast_ref::<crate::encodable_block::mixer::attention::Attention<B>>()
+            {
+                input = self
+                    .encode_code_attention_layer(layer, attention, &input, n, *rope_index, context)
+                    .map_err(|e| format!("code-decision layer {}: {e}", layer.layer_index))?;
+                continue;
+            }
+            let mut state = layer.mixer.create_empty_state(Some(n), context).map_err(|e| e.to_string())?;
+            let causal_recurrence = (layer.mixer.as_ref() as &dyn std::any::Any)
+                .is::<crate::encodable_block::mixer::delta_net::DeltaNet<B>>();
+            let mut next = context.create_buffer(input.size()).map_err(|e| e.to_string())?;
+            let mut offset = 0;
+            while offset < n {
+                // This is an execution tile, not a context limit. Carry the
+                // causal convolution/recurrent state through every tile; full
+                // bidirectional attention always sees the complete sequence.
+                // Align to the native 64-token GDN chunk and avoid a final
+                // <256 tile switching to a different recurrent kernel.
+                let remaining = n - offset;
+                let count = if causal_recurrence && remaining >= 4352 {
+                    4096
+                } else {
+                    remaining
+                };
+                let nodes = (0..count)
+                    .map(|i| crate::backends::common::gpu_types::trie::TrieNode {
+                        trie_start: i,
+                        trie_end: count - 1,
+                        height: i,
+                    })
+                    .collect::<Vec<_>>();
+                let tile = BatchTopology::new(&nodes, true);
+                state.prepare(offset, count).map_err(|e| e.to_string())?;
+                context.release_cached_buffers();
+                let mut cb =
+                    context.create_command_buffer(Some("code decision layer tile"), None).map_err(|e| e.to_string())?;
+                let start = offset as usize * row_bytes;
+                let end = (offset + count) as usize * row_bytes;
+                let mut hidden = cb.allocate_scratch(end - start).map_err(|e| e.to_string())?;
+                cb.encode_copy(input.subrange(start..end), &mut hidden);
+                let mut shortcut = cb.allocate_scratch(end - start).map_err(|e| e.to_string())?;
+                cb.encode_fill(&mut shortcut, 0);
+                let rope = rope_index
+                    .map(|i| {
+                        PrecalculatedRoPE::<B>::precalculate_with_precision(
+                            &self.ropes[i],
+                            &positions[offset as usize..(offset + count) as usize],
+                            self.bf16_rope_tables,
+                            &mut cb,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
+                let hidden = layer
+                    .encode(
+                        hidden,
+                        &mut shortcut,
+                        None::<&B::ScratchBuffer>,
+                        rope.as_ref(),
+                        &tile,
+                        Some(MaybeMut::Mut(state.as_mut())),
+                        &mut cb,
+                    )
+                    .map_err(|e| e.to_string())?;
+                let combined = self.capture_residual(&shortcut, &hidden, count, &mut cb).map_err(|e| e.to_string())?;
+                cb.encode_copy(&combined, next.subrange_mut(start..end));
+                if causal_recurrence {
+                    state.encode_accept(&(0..count).collect::<Vec<_>>(), &mut cb).map_err(|e| e.to_string())?;
+                }
+                drop(combined);
+                drop(hidden);
+                drop(shortcut);
+                drop(rope);
+                cb.end_encoding().submit().wait_until_completed().map_err(|e| {
+                    format!("code-decision layer {} tokens {offset}..{}: {e}", layer.layer_index, offset + count)
+                })?;
+                offset += count;
+            }
+            input = next;
+            drop(state);
+        }
+        context.release_cached_buffers();
+        let mut cb =
+            context.create_command_buffer(Some("code decision final norm"), None).map_err(|e| e.to_string())?;
+        let mut zeros = cb.allocate_scratch(input.size()).map_err(|e| e.to_string())?;
+        cb.encode_fill(&mut zeros, 0);
+        let norm = self
+            .output_norm
+            .encode(&input, n - 1, 1, (!self.layers.is_empty()).then_some(&mut zeros), &mut cb)
+            .map_err(|e| e.to_string())?;
+        let mut result = context.create_buffer(norm.size()).map_err(|e| e.to_string())?;
+        cb.encode_copy(&norm, &mut result);
+        drop(norm);
+        drop(zeros);
+        cb.end_encoding().submit().wait_until_completed().map_err(|e| e.to_string())?;
+        drop(input);
+        context.release_cached_buffers();
+        Ok(result)
+    }
+
     pub fn encode(
         &self,
         input: B::ScratchBuffer,
@@ -262,7 +465,14 @@ impl<B: Backend> Transformer<B> {
         let precalculated_ropes = self
             .ropes
             .iter()
-            .map(|rope_config| PrecalculatedRoPE::precalculate(rope_config, &token_positions, command_buffer))
+            .map(|rope_config| {
+                PrecalculatedRoPE::precalculate_with_precision(
+                    rope_config,
+                    &token_positions,
+                    self.bf16_rope_tables,
+                    command_buffer,
+                )
+            })
             .collect::<Result<Box<[_]>, B::Error>>()
             .map_err(TransformerEncodeError::Backend)?;
 
@@ -335,7 +545,7 @@ impl<B: Backend> Transformer<B> {
                 &hidden,
                 output_range.start,
                 output_range.end - output_range.start,
-                Some(&mut shortcut),
+                (!self.layers.is_empty()).then_some(&mut shortcut),
                 command_buffer,
             )
             .map_err(TransformerEncodeError::Backend)?;

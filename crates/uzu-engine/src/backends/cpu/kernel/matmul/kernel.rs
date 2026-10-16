@@ -181,92 +181,112 @@ impl MatmulKernel for MatmulCpuKernel {
                             None => col,
                         };
                         let mut accumulator = 0.0f32;
-                        for inner in 0..k_u {
-                            let a_value = match a_data {
-                                AData::FullPrecision(ptr) => read_f32(ptr.as_ptr(), input_data_type, row * k_u + inner),
-                                AData::Int8 {
-                                    values,
-                                    scales,
-                                    group_size,
-                                    code_layout,
-                                } => {
-                                    let groups = k_u.div_ceil(group_size);
-                                    let group = inner / group_size;
-                                    let code_index = code_layout.index(inner);
-                                    let q = *(values.as_ptr() as *const i8).add(row * k_u + code_index) as f32;
-                                    let scale = *(scales.as_ptr() as *const f32).add(row * groups + group);
-                                    q * scale
-                                },
-                            };
-                            let b_value = match &weight_data {
-                                WeightData::FullPrecision {
-                                    ptr,
-                                    leading_dimension,
-                                    transpose,
-                                } => {
-                                    let index = if *transpose {
-                                        b_col * leading_dimension + inner
-                                    } else {
-                                        inner * leading_dimension + b_col
-                                    };
-                                    read_f32(ptr.as_ptr(), weights_data_type, index)
-                                },
-                                WeightData::Quantized {
-                                    weights,
-                                    scales,
-                                    zero_points,
-                                    biases,
-                                    scale_strides,
-                                    bits,
-                                    group_size,
-                                    signed_codes,
-                                } => {
-                                    let pack_factor = 32 / *bits;
-                                    let weight_linear_index = b_col * k_u + inner;
-                                    let word_index = weight_linear_index / pack_factor;
-                                    let code_index_in_word = weight_linear_index % pack_factor;
-                                    let bit_offset = code_index_in_word * *bits;
-                                    let weights_words = weights.as_ptr() as *const u32;
-                                    let word = weights_words.add(word_index).read_unaligned();
-                                    let code_mask = (1u32 << bits) - 1;
-                                    let mut weight_code = ((word >> bit_offset) & code_mask) as u8;
-                                    if *signed_codes {
-                                        weight_code ^= 1u8 << (bits - 1);
-                                    }
-                                    let quantized_value = f32::from(weight_code);
-                                    let group_index = inner / group_size;
-                                    let metadata_index = b_col * scale_strides.output_stride as usize
-                                        + group_index * scale_strides.group_stride as usize;
-                                    let scale = read_f32(scales.as_ptr(), weights_data_type, metadata_index);
-                                    let midpoint = (1u32 << (bits - 1)) as f32;
-                                    let zero_point = zero_points.as_ref().map(|(zp, strides)| {
-                                        let zero_point_index = b_col * strides.output_stride as usize
-                                            + group_index * strides.group_stride as usize;
-                                        if *bits == 4 {
-                                            let byte_index = zero_point_index / 2;
-                                            let byte_value = *zp.as_ptr().add(byte_index);
-                                            if zero_point_index.is_multiple_of(2) {
-                                                (byte_value & 0x0F) as f32
-                                            } else {
-                                                ((byte_value >> 4) & 0x0F) as f32
-                                            }
+                        if let (
+                            AData::FullPrecision(input),
+                            WeightData::FullPrecision {
+                                ptr,
+                                leading_dimension,
+                                transpose: true,
+                            },
+                        ) = (&a_data, &weight_data)
+                            && input_data_type == DataType::BF16
+                            && weights_data_type == DataType::BF16
+                        {
+                            accumulator = super::dot::bf16_vector_dot(k_u, |inner| {
+                                (
+                                    read_f32(input.as_ptr(), input_data_type, row * k_u + inner),
+                                    read_f32(ptr.as_ptr(), weights_data_type, b_col * leading_dimension + inner),
+                                )
+                            });
+                        } else {
+                            for inner in 0..k_u {
+                                let a_value = match a_data {
+                                    AData::FullPrecision(ptr) => {
+                                        read_f32(ptr.as_ptr(), input_data_type, row * k_u + inner)
+                                    },
+                                    AData::Int8 {
+                                        values,
+                                        scales,
+                                        group_size,
+                                        code_layout,
+                                    } => {
+                                        let groups = k_u.div_ceil(group_size);
+                                        let group = inner / group_size;
+                                        let code_index = code_layout.index(inner);
+                                        let q = *(values.as_ptr() as *const i8).add(row * k_u + code_index) as f32;
+                                        let scale = *(scales.as_ptr() as *const f32).add(row * groups + group);
+                                        q * scale
+                                    },
+                                };
+                                let b_value = match &weight_data {
+                                    WeightData::FullPrecision {
+                                        ptr,
+                                        leading_dimension,
+                                        transpose,
+                                    } => {
+                                        let index = if *transpose {
+                                            b_col * leading_dimension + inner
                                         } else {
-                                            *zp.as_ptr().add(zero_point_index) as f32
+                                            inner * leading_dimension + b_col
+                                        };
+                                        read_f32(ptr.as_ptr(), weights_data_type, index)
+                                    },
+                                    WeightData::Quantized {
+                                        weights,
+                                        scales,
+                                        zero_points,
+                                        biases,
+                                        scale_strides,
+                                        bits,
+                                        group_size,
+                                        signed_codes,
+                                    } => {
+                                        let pack_factor = 32 / *bits;
+                                        let weight_linear_index = b_col * k_u + inner;
+                                        let word_index = weight_linear_index / pack_factor;
+                                        let code_index_in_word = weight_linear_index % pack_factor;
+                                        let bit_offset = code_index_in_word * *bits;
+                                        let weights_words = weights.as_ptr() as *const u32;
+                                        let word = weights_words.add(word_index).read_unaligned();
+                                        let code_mask = (1u32 << bits) - 1;
+                                        let mut weight_code = ((word >> bit_offset) & code_mask) as u8;
+                                        if *signed_codes {
+                                            weight_code ^= 1u8 << (bits - 1);
                                         }
-                                    });
-                                    let bias_term = if let Some(zp) = zero_point {
-                                        -scale * zp
-                                    } else if let Some(b) = biases {
-                                        read_f32(b.as_ptr(), weights_data_type, metadata_index)
-                                    } else {
-                                        -scale * midpoint
-                                    };
-                                    scale * quantized_value + bias_term
-                                },
-                            };
-                            accumulator += a_value * b_value;
+                                        let quantized_value = f32::from(weight_code);
+                                        let group_index = inner / group_size;
+                                        let metadata_index = b_col * scale_strides.output_stride as usize
+                                            + group_index * scale_strides.group_stride as usize;
+                                        let scale = read_f32(scales.as_ptr(), weights_data_type, metadata_index);
+                                        let midpoint = (1u32 << (bits - 1)) as f32;
+                                        let zero_point = zero_points.as_ref().map(|(zp, strides)| {
+                                            let zero_point_index = b_col * strides.output_stride as usize
+                                                + group_index * strides.group_stride as usize;
+                                            if *bits == 4 {
+                                                let byte_index = zero_point_index / 2;
+                                                let byte_value = *zp.as_ptr().add(byte_index);
+                                                if zero_point_index.is_multiple_of(2) {
+                                                    (byte_value & 0x0F) as f32
+                                                } else {
+                                                    ((byte_value >> 4) & 0x0F) as f32
+                                                }
+                                            } else {
+                                                *zp.as_ptr().add(zero_point_index) as f32
+                                            }
+                                        });
+                                        let bias_term = if let Some(zp) = zero_point {
+                                            -scale * zp
+                                        } else if let Some(b) = biases {
+                                            read_f32(b.as_ptr(), weights_data_type, metadata_index)
+                                        } else {
+                                            -scale * midpoint
+                                        };
+                                        scale * quantized_value + bias_term
+                                    },
+                                };
+                                accumulator += a_value * b_value;
+                            }
                         }
-
                         let output_index = row * n_u + col;
                         let mut value = output_scale * accumulator;
                         if !bias_after_rht && let Some(bias) = bias_ptr {

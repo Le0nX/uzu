@@ -266,3 +266,56 @@ fn test_silu_in_place_large_f32() {
 fn test_gelu_in_place_large_f32() {
     test_activation_large::<f32>(ActivationType::GELUApprox, true);
 }
+
+// Decision heads use an ungated ReLU FFN. Exercise exact zero/negative
+// behavior separately from the GPU-vs-CPU comparisons.
+#[uzu_test]
+fn test_relu_values() {
+    let input = Input {
+        data: vec![-3.0f32, -0.0, 0.0, 0.25, 4.0].into_boxed_slice(),
+        act_type: ActivationType::RELU,
+        in_place: true,
+    };
+    assert_eq!(get_output::<f32, Cpu>(&input), vec![0.0, 0.0, 0.0, 0.25, 4.0]);
+}
+#[uzu_test]
+fn test_relu_f32() {
+    test_activation::<f32>(ActivationType::RELU, false);
+}
+#[uzu_test]
+fn test_relu_bf16() {
+    test_activation::<bf16>(ActivationType::RELU, false);
+}
+#[uzu_test]
+fn test_relu_in_place_f32() {
+    test_activation::<f32>(ActivationType::RELU, true);
+}
+#[uzu_test]
+fn test_relu_in_place_bf16() {
+    test_activation::<bf16>(ActivationType::RELU, true);
+}
+
+#[uzu_test]
+fn test_relu_preserves_nan_and_signed_zero() {
+    let input = Input {
+        data: vec![f32::NAN, f32::NEG_INFINITY, f32::INFINITY, -0.0].into_boxed_slice(),
+        act_type: ActivationType::RELU,
+        in_place: false,
+    };
+    let output = get_output::<f32, Cpu>(&input);
+    assert!(output[0].is_nan());
+    assert_eq!(output[1], 0.0);
+    assert_eq!(output[2], f32::INFINITY);
+    assert!(output[3].is_sign_negative());
+}
+
+#[uzu_test]
+#[ignore]
+fn dump_pytorch_bf16_gelu_conformance() {
+    let mut bytes = Vec::with_capacity(65536 * 2);
+    for bits in 0..=u16::MAX {
+        let y = ActivationType::GELUExactPyTorchBF16.activate(bf16::from_bits(bits));
+        bytes.extend_from_slice(&y.to_bits().to_le_bytes());
+    }
+    std::fs::write(std::env::var("UZU_GELU_DUMP").unwrap(), bytes).unwrap();
+}

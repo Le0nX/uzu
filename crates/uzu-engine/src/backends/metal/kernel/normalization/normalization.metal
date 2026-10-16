@@ -116,7 +116,16 @@ PUBLIC KERNEL(Normalization)(
     // If full_layer, normalize and scale in AccumT, cast to OutputT at the end
     // If not, cast to OutputT after normalize, scale in OutputT
     OutputT val;
-    if (has_scales) {
+    if (full_layer) {
+      AccumT affine = (x - mean) * rms_inv;
+      if (has_scales) {
+        affine *= static_cast<AccumT>(scales[i]) + static_cast<AccumT>(scale_offset);
+      }
+      if (has_biases) {
+        affine += static_cast<AccumT>(biases[i]);
+      }
+      val = static_cast<OutputT>(affine);
+    } else if (has_scales) {
       AccumT scale = static_cast<AccumT>(scales[i]) + static_cast<AccumT>(scale_offset);
       if (full_layer) {
         val = static_cast<OutputT>((x - mean) * rms_inv * scale);
@@ -127,7 +136,7 @@ PUBLIC KERNEL(Normalization)(
       val = static_cast<OutputT>((x - mean) * rms_inv);
     }
 
-    if (has_biases) {
+    if (has_biases && !full_layer) {
       val = static_cast<OutputT>(static_cast<AccumT>(val) + static_cast<AccumT>(biases[i]));
     }
 

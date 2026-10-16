@@ -7,7 +7,7 @@ use crate::{
         common::gpu_types::hadamard_order::HADAMARD_TRANSFORM_BLOCK_SIZE,
         cpu::kernel::activation_transform::hadamard_transform,
     },
-    data_type::DataTypeRepr,
+    data_type::{DataType, DataTypeRepr},
 };
 
 #[kernel(Normalization)]
@@ -67,6 +67,7 @@ pub fn normalization<
         // Compute mean / rms_inv (+ residual add or copy to shortcut)
         let mut sum = AccumT::zero();
         let mut sum_sq = AccumT::zero();
+        let stable_layer_norm = full_layer && subtract_mean && InputT::data_type() == DataType::BF16;
         for i in 0..element_count {
             let input_val = unsafe { *input.add(batch_offset + i) };
             let mut val = input_val;
@@ -86,12 +87,27 @@ pub fn normalization<
             }
             sum_sq = sum_sq + accum_val * accum_val;
         }
-        let mean = if subtract_mean {
+        let stable_moments = stable_layer_norm.then(|| {
+            super::moments::bf16_moments(element_count, |i| unsafe {
+                if residual_add {
+                    (*shortcut.unwrap().add(batch_offset + i)).to_f32().unwrap()
+                } else {
+                    (*input.add(batch_offset + i)).to_f32().unwrap()
+                }
+            })
+        });
+        let mean = if let Some((mean, _)) = stable_moments {
+            AccumT::from(mean).unwrap()
+        } else if subtract_mean {
             sum / element_count_accum
         } else {
             AccumT::zero()
         };
-        let variance = sum_sq / element_count_accum - mean * mean;
+        let variance = if let Some((_, variance)) = stable_moments {
+            AccumT::from(variance).unwrap()
+        } else {
+            sum_sq / element_count_accum - mean * mean
+        };
         let rms_inv = AccumT::from((variance + epsilon).to_f32().unwrap().sqrt().recip()).unwrap();
 
         // Normalization and scaling
@@ -101,8 +117,24 @@ pub fn normalization<
             } else {
                 unsafe { AccumT::from(*input.add(batch_offset + i)).unwrap() }
             };
-            let normalized: AccumT = (input_val - mean) * rms_inv;
-            let mut result: OutputT = if has_scales {
+            let normalized: AccumT = if stable_layer_norm {
+                input_val * rms_inv + (-rms_inv * mean)
+            } else {
+                (input_val - mean) * rms_inv
+            };
+            let mut result: OutputT = if full_layer {
+                // LayerNorm's affine transform belongs to the upcast operation:
+                // round only after both the scale and bias, not between them.
+                let mut affine = normalized;
+                if has_scales {
+                    let scale_val = unsafe { AccumT::from(*scales.unwrap().add(i)).unwrap() };
+                    affine = affine * (scale_val + scale_offset);
+                }
+                if has_biases {
+                    affine = affine + unsafe { AccumT::from(*biases.unwrap().add(i)).unwrap() };
+                }
+                OutputT::from(affine).unwrap()
+            } else if has_scales {
                 let scale_val = unsafe { AccumT::from(*scales.unwrap().add(i)).unwrap() };
                 if full_layer {
                     // Full-layer: keep everything in accumulation precision
@@ -117,7 +149,7 @@ pub fn normalization<
             } else {
                 OutputT::from(normalized).unwrap()
             };
-            if has_biases {
+            if has_biases && !full_layer {
                 let bias = unsafe { AccumT::from(*biases.unwrap().add(i)).unwrap() };
                 result = OutputT::from(AccumT::from(result).unwrap() + bias).unwrap();
             }

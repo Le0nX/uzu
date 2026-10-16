@@ -4,9 +4,10 @@ use crate::backends::common::gpu_types::activation_type::ActivationType;
 
 pub mod gelu;
 pub mod identity;
+pub mod relu;
 pub mod silu;
 
-#[uzu_config_abstract(silu::SiLU, gelu::GELU, identity::Identity)]
+#[uzu_config_abstract(silu::SiLU, gelu::GELU, identity::Identity, relu::ReLU)]
 pub struct Activation;
 
 impl AnyActivation {
@@ -19,16 +20,22 @@ impl AnyActivation {
             }) => ActivationType::GELUApprox,
             AnyActivation::GELU(gelu::GELU {
                 approximate: false,
+                pytorch_bf16: true,
+                ..
+            }) => ActivationType::GELUExactPyTorchBF16,
+            AnyActivation::GELU(gelu::GELU {
+                approximate: false,
                 ..
             }) => ActivationType::GELUExact,
             AnyActivation::Identity(_) => ActivationType::IDENTITY,
+            AnyActivation::ReLU(_) => ActivationType::RELU,
         }
     }
 
     pub fn alpha(&self) -> f32 {
         match self {
             AnyActivation::SiLU(config) => config.alpha,
-            AnyActivation::GELU(_) | AnyActivation::Identity(_) => 1.0,
+            AnyActivation::GELU(_) | AnyActivation::Identity(_) | AnyActivation::ReLU(_) => 1.0,
         }
     }
 

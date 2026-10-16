@@ -1,4 +1,5 @@
 mod dense;
+mod feed_forward;
 mod gate_act_mul;
 
 use derive_more::Debug;
@@ -36,6 +37,8 @@ pub trait Mlp<B: Backend>: Send + Sync {
 pub enum MlpBlockNewError<B: Backend> {
     #[error("Dense MLP error: {0}")]
     Dense(#[from] DenseMlpNewError<B>),
+    #[error("Feed-forward error: {0}")]
+    FeedForward(#[from] feed_forward::FeedForwardNewError<B>),
     #[error("Mixture of experts is not supported")]
     UnsupportedMixtureOfExperts,
 }
@@ -55,6 +58,17 @@ impl<B: Backend> dyn Mlp<B> {
                     DenseMlp::new(model_dimension, hidden_dimension, data_type, config, parameter_tree, context)?;
 
                 Ok((Box::new(dense), up_input_hadamard_factors))
+            },
+            AnyMLPConfig::FeedForwardMLPConfig(config) => {
+                let (block, factors) = feed_forward::FeedForward::new(
+                    model_dimension,
+                    hidden_dimension,
+                    data_type,
+                    config,
+                    parameter_tree,
+                    context,
+                )?;
+                Ok((Box::new(block), factors))
             },
             AnyMLPConfig::MixtureOfExpertsConfig(_) => Err(MlpBlockNewError::UnsupportedMixtureOfExperts),
         }

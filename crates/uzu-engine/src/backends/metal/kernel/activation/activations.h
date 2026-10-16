@@ -77,6 +77,32 @@ inline T activate_softplus(T x) {
   return static_cast<T>(result);
 }
 
+// Explicit all-BF16 PyTorch CPU math compatibility. Existing exact GELU is
+// retained; this path is selected only by the marker precision policy.
+inline float pytorch_neon_exp(float x) {
+  if (!metal::isfinite(x) || metal::abs(x)>87.3f) return metal::precise::exp(x);
+  const float inv_ln2=0x1.715476p+0f, ln2_hi=0x1.62e4p-1f, ln2_lo=0x1.7f7d1cp-20f;
+  const float c0=0x1.0e4020p-7f,c2=0x1.555e66p-3f,c1=0x1.573e2ep-5f,c3=0x1.fffdb6p-2f,c4=0x1.ffffecp-1f;
+  float n=metal::round(x*inv_ln2);
+  float r=metal::fma(-n,ln2_hi,x); r=metal::fma(-n,ln2_lo,r);
+  float scale=as_type<float>(0x3f800000u+(uint(int(n))<<23));
+  float r2=r*r,p=metal::fma(r,c0,c1),q=metal::fma(r,c2,c3);
+  q=metal::fma(r2,p,q);float poly=metal::fma(r2,q,c4*r);
+  return metal::fma(scale,poly,scale);
+}
+inline float pytorch_neon_erf(float x) {
+  float t=1.0f/metal::fma(0.3275911f,metal::abs(x),1.0f);
+  float r=metal::fma(1.061405429f,t,-1.453152027f);
+  r=metal::fma(r,t,1.421413741f);r=metal::fma(r,t,-0.284496736f);r=metal::fma(r,t,0.254829592f);
+  float y=metal::fma(-t*pytorch_neon_exp(-(x*x)),r,1.0f);
+  return as_type<float>(as_type<uint>(y)^(as_type<uint>(x)&0x80000000u));
+}
+template <typename T> inline T activate_gelu_pytorch_bf16(T x) {return activate_gelu_exact(x);}
+template <> inline bfloat activate_gelu_pytorch_bf16<bfloat>(bfloat x) {
+  const float xf=float(x);
+  return bfloat(0.5f*xf*(1.0f+pytorch_neon_erf(xf*0.7071067811865475f)));
+}
+
 template <typename T>
 inline T activate(T x, ActivationType type) {
   switch (type) {
@@ -90,5 +116,9 @@ inline T activate(T x, ActivationType type) {
     return x;
   case ActivationType::SOFTPLUS:
     return activate_softplus(x);
+  case ActivationType::GELUExactPyTorchBF16:
+    return activate_gelu_pytorch_bf16(x);
+  case ActivationType::RELU:
+    return x < static_cast<T>(0) ? static_cast<T>(0) : x;
   }
 }

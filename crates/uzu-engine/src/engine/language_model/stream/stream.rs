@@ -820,7 +820,7 @@ impl<'a, B: Backend> Drop for LanguageModelStream<'a, B> {
                                 &[0],
                                 &mut command_buffer,
                             )
-                            .unwrap();
+                            .unwrap_or_else(|error| panic!("unable to accept speculative state: {error}"));
                     }
                     command_buffer.end_encoding().submit().wait_until_completed().unwrap();
                 }
@@ -859,7 +859,7 @@ impl<'a, B: Backend> Drop for LanguageModelStream<'a, B> {
                             &accepted_token_indicies,
                             &mut command_buffer,
                         )
-                        .unwrap();
+                        .unwrap_or_else(|error| panic!("unable to accept speculative state: {error}"));
                 }
                 command_buffer.end_encoding().submit().wait_until_completed().unwrap();
 

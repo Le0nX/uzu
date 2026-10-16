@@ -13,7 +13,15 @@ use crate::{
 };
 
 pub mod classifier_model;
+pub mod code_decision_model;
+pub mod code_readout;
+pub mod d3;
+pub mod decision_model;
+pub mod decision_request;
 pub mod language_model;
+pub mod modernbert_marker;
+pub mod nimble;
+pub mod typed_decision;
 
 pub struct Engine<B: Backend> {
     _capture_span: Option<CaptureMatcherSpan>,
@@ -48,6 +56,7 @@ impl<B: Backend> Engine<B> {
 pub enum ModelType {
     LanguageModel,
     Classifier,
+    Decision,
 }
 
 #[derive(Debug, Error)]
@@ -62,13 +71,16 @@ pub fn resolve_model_type(model_path: &Path) -> Result<ModelType, ResolveModelTy
     Ok(match read_model_config(model_path)? {
         AnyModelConfig::LanguageModelConfig(_) => ModelType::LanguageModel,
         AnyModelConfig::ClassifierModelConfig(_) => ModelType::Classifier,
+        AnyModelConfig::DecisionModelConfig(_) | AnyModelConfig::CodeDecisionModelConfig(_) => ModelType::Decision,
     })
 }
 
 pub fn resolve_model_sampling_method(model_path: &Path) -> Result<Option<SamplingMethod>, ResolveModelTypeError> {
     Ok(match read_model_config(model_path)? {
         AnyModelConfig::LanguageModelConfig(config) => Some(config.generation_config.default_sampling_method()),
-        AnyModelConfig::ClassifierModelConfig(_) => None,
+        AnyModelConfig::ClassifierModelConfig(_)
+        | AnyModelConfig::DecisionModelConfig(_)
+        | AnyModelConfig::CodeDecisionModelConfig(_) => None,
     })
 }
 
@@ -76,6 +88,8 @@ pub fn resolve_model_context_length(model_path: &Path) -> Result<Option<u32>, Re
     let transformer = match read_model_config(model_path)? {
         AnyModelConfig::LanguageModelConfig(config) => config.decoder_config.transformer_config,
         AnyModelConfig::ClassifierModelConfig(_) => return Ok(None),
+        AnyModelConfig::DecisionModelConfig(config) => return Ok(Some(config.decision_config.max_sequence_length)),
+        AnyModelConfig::CodeDecisionModelConfig(config) => return Ok(Some(config.max_sequence_length)),
     };
     Ok(transformer
         .layer_configs

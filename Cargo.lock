@@ -7521,6 +7521,7 @@ dependencies = [
  "depfile",
  "derive_more",
  "half",
+ "indexmap 2.14.0",
  "is_close",
  "itertools 0.14.0",
  "keisoku",

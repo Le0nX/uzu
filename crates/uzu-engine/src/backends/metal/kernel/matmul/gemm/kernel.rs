@@ -156,7 +156,7 @@ impl GemmKernel {
             shape,
             self.weights_data_type,
             self.output_data_type,
-            context.supports_mxu,
+            context.supports_mxu && !super::requires_simdgroup(self.weights_data_type, self.input_data_type),
             context.apple_gpu_family,
         )
     }

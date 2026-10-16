@@ -96,7 +96,13 @@ impl GemvSpecialization {
         } else {
             let mixed_precision = weights_data_type == DataType::F32
                 && (input_data_type != DataType::F32 || output_data_type != DataType::F32);
-            if mixed_precision || shape.n < DEFAULT_RESULTS_PER_SIMDGROUP || shape.m > GEMV_MAX_BATCH {
+            // Gather has no GEMM fallback. The GEMV tail path already masks
+            // output rows, including fewer than one SIMD group's results.
+            if mixed_precision
+                || shape.n == 0
+                || (!shape.gathered && shape.n < DEFAULT_RESULTS_PER_SIMDGROUP)
+                || shape.m > GEMV_MAX_BATCH
+            {
                 return None;
             }
             let input_aligned = shape.k.is_multiple_of(FP_K_BLOCK);
@@ -135,7 +141,11 @@ impl GemvSpecialization {
         if !is_quant {
             let mixed_precision = weights_data_type == DataType::F32
                 && (input_data_type != DataType::F32 || output_data_type != DataType::F32);
-            if mixed_precision || shape.n < DEFAULT_RESULTS_PER_SIMDGROUP || shape.m > GEMV_MAX_BATCH {
+            if mixed_precision
+                || shape.n == 0
+                || (!shape.gathered && shape.n < DEFAULT_RESULTS_PER_SIMDGROUP)
+                || shape.m > GEMV_MAX_BATCH
+            {
                 return None;
             }
         }

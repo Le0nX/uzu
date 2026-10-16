@@ -27,6 +27,9 @@ pub trait Context: Sized + Send + Sync {
 
     fn create_allocation_pool(&self) -> Arc<<Self::Backend as Backend>::AllocationPool>;
 
+    /// Release idle allocations after completed work; never discard live tensors.
+    fn release_cached_buffers(&self) {}
+
     fn peak_memory_usage(&self) -> Option<usize>;
 
     fn start_capture(

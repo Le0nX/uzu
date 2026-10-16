@@ -15,5 +15,7 @@ enum class ActivationType : uint32_t {
   GELUExact = 2,
   IDENTITY = 3,
   SOFTPLUS = 4,
+  RELU = 5,
+  GELUExactPyTorchBF16 = 6,
 };
 } // namespace uzu::activation_type

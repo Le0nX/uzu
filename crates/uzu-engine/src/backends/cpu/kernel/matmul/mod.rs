@@ -1,3 +1,4 @@
+pub(crate) mod dot;
 mod error;
 mod kernel;
 mod reference;

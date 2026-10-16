@@ -24,6 +24,7 @@ use crate::{
     utils::maybe_mut::MaybeMut,
 };
 
+mod eager;
 mod mode;
 mod qkv_norm;
 mod state;
@@ -33,6 +34,7 @@ pub use state::{ATTENTION_SUFFIX_CAPACITY, AttentionState, KVCacheView};
 pub mod rope;
 
 pub struct Attention<B: Backend> {
+    is_causal: bool,
     head_dim: u32,
     num_q_heads: u32,
     num_kv_heads: Option<u32>,
@@ -45,11 +47,14 @@ pub struct Attention<B: Backend> {
     prepare: <B::Kernels as Kernels>::AttentionPrepareKernel,
     sinks: Option<B::GlobalBuffer>,
     kernel: <B::Kernels as Kernels>::AttentionKernel,
+    eager: Option<eager::EagerAttention<B>>,
     out_projection: Box<dyn Linear<B>>,
 }
 
 #[derive(Debug, Error)]
 pub enum AttentionNewError<B: Backend> {
+    #[error("Unsupported attention configuration: {0}")]
+    UnsupportedConfiguration(String),
     #[error("Attention kernel error: {0}")]
     Kernel(#[source] <<B::Kernels as Kernels>::AttentionKernel as AttentionKernel>::Error),
     #[error("Backend error: {0}")]
@@ -64,6 +69,8 @@ pub enum AttentionNewError<B: Backend> {
 
 #[derive(Debug, Error)]
 pub enum AttentionEncodeError<B: Backend> {
+    #[error("Eager BF16 encoder attention requires a stateless flat sequence")]
+    EagerStateUnsupported,
     #[error("Backend error: {0}")]
     Backend(#[source] B::Error),
     #[error("Linear error: {0}")]
@@ -82,6 +89,22 @@ impl<B: Backend> Attention<B> {
         context: &B::Context,
     ) -> Result<(Self, Option<B::GlobalBuffer>), AttentionNewError<B>> {
         let is_kv_sharing = config.is_kv_sharing;
+        if config.bf16_eager
+            && (config.is_causal
+                || config.has_sinks
+                || config.has_gate
+                || config.is_kv_sharing
+                || config.num_heads != config.num_groups
+                || config.logit_soft_cap.is_some())
+        {
+            return Err(AttentionNewError::UnsupportedConfiguration(
+                "bf16_eager supports stateless bidirectional MHA without sinks, gates, KV sharing or soft caps".into(),
+            ));
+        }
+        let eager = (config.bf16_eager && data_type == DataType::BF16)
+            .then(|| eager::EagerAttention::new(config, data_type, context))
+            .transpose()
+            .map_err(AttentionNewError::Backend)?;
 
         let head_dim = config.head_dim;
         let num_groups = config.num_groups;
@@ -175,6 +198,7 @@ impl<B: Backend> Attention<B> {
 
         Ok((
             Self {
+                is_causal: config.is_causal,
                 head_dim,
                 num_q_heads,
                 num_kv_heads,
@@ -190,6 +214,7 @@ impl<B: Backend> Attention<B> {
                 prepare,
                 sinks,
                 kernel,
+                eager,
                 out_projection,
             },
             in_projection_input_hadamard_factors,

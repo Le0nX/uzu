@@ -17,6 +17,11 @@ impl<T> BlockAllocator<T> {
         })
     }
 
+    /// Release only cached, unowned allocations. Live buffers remain untouched.
+    pub fn release_cached(&self) {
+        self.cache.lock().clear();
+    }
+
     pub fn allocate<E>(
         self: &Arc<Self>,
         size: usize,
@@ -68,5 +73,27 @@ impl<T> BlockAllocation<T> {
 impl<T> Drop for BlockAllocation<T> {
     fn drop(&mut self) {
         self.allocator.free(unsafe { ManuallyDrop::take(&mut self.page) }, self.range);
+    }
+}
+
+#[cfg(test)]
+mod cache_release_tests {
+    use super::*;
+    #[uzu_engine_macros::uzu_test]
+    fn release_drops_idle_pages_but_preserves_live_pages() {
+        let allocator = BlockAllocator::new(16);
+        let idle = allocator.allocate(16, |_| Ok::<_, ()>(Arc::new(23u8))).unwrap();
+        let idle_weak = Arc::downgrade(idle.page());
+        let live = allocator.allocate(16, |_| Ok::<_, ()>(Arc::new(47u8))).unwrap();
+        drop(idle);
+        assert!(idle_weak.upgrade().is_some());
+        allocator.release_cached();
+        assert!(idle_weak.upgrade().is_none());
+        assert_eq!(**live.page(), 47);
+        let live_weak = Arc::downgrade(live.page());
+        drop(live);
+        assert!(live_weak.upgrade().is_some());
+        allocator.release_cached();
+        assert!(live_weak.upgrade().is_none());
     }
 }

@@ -15,6 +15,15 @@ impl<B: Backend> PrecalculatedRoPE<B> {
         token_positions: &[u32],
         command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
     ) -> Result<Self, B::Error> {
+        Self::precalculate_with_precision(rope_config, token_positions, false, command_buffer)
+    }
+
+    pub(crate) fn precalculate_with_precision(
+        rope_config: &AnyRoPEConfig,
+        token_positions: &[u32],
+        bf16_tables: bool,
+        command_buffer: &mut <B::CommandBuffer as CommandBuffer>::Encoding,
+    ) -> Result<Self, B::Error> {
         let head_dim = *rope_config.head_dim();
         assert!(head_dim > 0 && head_dim.is_multiple_of(2), "RoPE head_dim must be positive and even");
         let half_dim = head_dim / 2;
@@ -89,10 +98,21 @@ impl<B: Backend> PrecalculatedRoPE<B> {
                 },
             };
 
+            // An all-BF16 ModernBERT module also casts its registered inv_freq
+            // buffer. Promote the rounded value for the position multiplication.
+            let inverse_frequency = if bf16_tables {
+                half::bf16::from_f32(inverse_frequency).to_f32()
+            } else {
+                inverse_frequency
+            };
             for (token_index, token_position) in token_positions.iter().enumerate() {
                 let embedding = *token_position as f32 * inverse_frequency;
-                let sine = embedding.sin() * attention_scaling_factor;
-                let cosine = embedding.cos() * attention_scaling_factor;
+                let mut sine = embedding.sin() * attention_scaling_factor;
+                let mut cosine = embedding.cos() * attention_scaling_factor;
+                if bf16_tables {
+                    sine = half::bf16::from_f32(sine).to_f32();
+                    cosine = half::bf16::from_f32(cosine).to_f32();
+                }
                 let pair_offset = token_index * head_dim as usize + pair_index as usize;
                 sines[pair_offset] = sine;
                 sines[pair_offset + half_offset] = sine;
